@@ -1,11 +1,11 @@
-# bot.py — минимальный и стабильный
+# bot.py — без спама, один статус после паузы
 import os
 import re
 import asyncio
 import logging
 import requests
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -18,12 +18,15 @@ from aiogram.filters import Command
 
 # ======= ТОКЕНЫ =======
 TELEGRAM_TOKEN = "8306801846:AAEvDQFoiepNmDaxPi5UVDqiNWmz6tUO_KQ"
-YANDEX_TOKEN = "y0__xCmksrUBxjjojogmLvAsxTMieHo_qAobIbgob8lZd-uDHpoew"
+YANDEX_TOKEN   = "y0__xCmksrUBxjjojogmLvAsxTMieHo_qAobIbgob8lZd-uDHpoew"
 
 # ====== ЛОГИ И БОТ ======
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
+dp  = Dispatcher()
+
+# ====== Константы ======
+SUMMARY_DELAY_SEC = 2.0  # задержка тишины, после которой показываем ОДИН статус
 
 # ====== Список магазинов ======
 STORES: List[str] = [
@@ -48,7 +51,8 @@ STORES: List[str] = [
 YANDEX_BASE = "/Sam/Проект Crown/Фотоотчеты CROWN"
 
 # Сессии пользователей
-# user_id -> {"store": str, "files": List[str], "status_msg": Tuple[int,int] | None, "tmp_dir": str}
+# user_id -> {"store": str, "files": List[str], "tmp_dir": str,
+#             "status_msg": Optional[Tuple[int,int]], "summary_task": Optional[asyncio.Task]}
 user_sessions: Dict[int, Dict[str, Any]] = {}
 
 # ====== УТИЛИТЫ (Yandex) ======
@@ -78,15 +82,12 @@ def upload_to_yandex(local_file: str, remote_path: str) -> bool:
             return False
         with open(local_file, "rb") as f:
             r = requests.put(upload_url, files={"file": f}, timeout=120)
-        success = r.status_code in (201, 202)
-        if not success:
-            logging.error("Upload failed %s %s", r.status_code, r.text)
-        return success
+        return r.status_code in (201, 202)
     except Exception:
         logging.exception("upload_to_yandex error")
         return False
 
-def get_week_folder(now: datetime = None) -> str:
+def get_week_folder(now: Optional[datetime] = None) -> str:
     if now is None:
         now = datetime.now()
     start = now - timedelta(days=now.weekday())
@@ -98,6 +99,7 @@ def build_stores_keyboard() -> InlineKeyboardMarkup:
     def store_key(s: str) -> int:
         nums = re.findall(r"\d+", s)
         return int(nums[-1]) if nums else 0
+
     sorted_stores = sorted(STORES, key=store_key)
     buttons = [InlineKeyboardButton(text=s, callback_data=f"store:{s}") for s in sorted_stores]
     rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
@@ -108,10 +110,62 @@ def build_send_keyboard() -> InlineKeyboardMarkup:
     btn = InlineKeyboardButton(text="📤 Отправить отчёт", callback_data="confirm_upload")
     return InlineKeyboardMarkup(inline_keyboard=[[btn]])
 
+# ====== ХЭЛПЕРЫ ======
+async def schedule_summary_message(message: Message, user_id: int):
+    """
+    Планирует показ ОДНОГО статус-сообщения после паузы SUMMARY_DELAY_SEC.
+    Если в этот момент уже есть статус — просто редактируем его.
+    """
+    session = user_sessions.get(user_id)
+    if not session:
+        return
+
+    # отменяем предыдущий таймер, если есть
+    task: Optional[asyncio.Task] = session.get("summary_task")
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except Exception:
+            pass
+
+    async def delayed():
+        try:
+            await asyncio.sleep(SUMMARY_DELAY_SEC)
+            sess = user_sessions.get(user_id)
+            if not sess:
+                return
+            total = len(sess["files"])
+            text = (
+                f"Фото принято ✅  Всего: {total} шт.\n\n"
+                f"Когда закончите — нажмите кнопку ниже, чтобы отправить отчёт."
+            )
+            kb = build_send_keyboard()
+            if sess.get("status_msg"):
+                chat_id, msg_id = sess["status_msg"]
+                try:
+                    await bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+                except Exception:
+                    sent = await message.answer(text, reply_markup=kb)
+                    sess["status_msg"] = (sent.chat.id, sent.message_id)
+            else:
+                sent = await message.answer(text, reply_markup=kb)
+                sess["status_msg"] = (sent.chat.id, sent.message_id)
+        except asyncio.CancelledError:
+            # таймер сброшен новой фоткой — молча выходим
+            return
+
+    session["summary_task"] = asyncio.create_task(delayed())
+
+def clear_summary_task(session: Dict[str, Any]):
+    task: Optional[asyncio.Task] = session.get("summary_task")
+    if task and not task.done():
+        task.cancel()
+
 # ====== КОМАНДЫ ======
 @dp.message(Command("otchet"))
 async def cmd_report(message: Message):
-    # новая сессия
+    # новая чистая сессия
     user_sessions.pop(message.from_user.id, None)
     await message.answer("Выберите магазин (нажми кнопку):", reply_markup=build_stores_keyboard())
 
@@ -128,27 +182,23 @@ async def process_store_choice(cq: CallbackQuery):
     user_sessions[user_id] = {
         "store": store,
         "files": [],
-        "status_msg": None,  # (chat_id, message_id)
         "tmp_dir": tmp_dir,
+        "status_msg": None,        # (chat_id, message_id)
+        "summary_task": None,      # asyncio.Task
     }
 
-    # Инструкция
-    await cq.message.answer(
-        "Теперь отправьте фото.\nПосле всех фото нажмите кнопку «📤 Отправить отчёт».",
-    )
-
-    # Стартовый статус (0 шт.)
-    status_text = "Фото принято ✅  Всего: 0 шт.\n\nКогда закончите — нажмите кнопку ниже, чтобы отправить отчёт."
-    sent = await cq.message.answer(status_text, reply_markup=build_send_keyboard())
-    user_sessions[user_id]["status_msg"] = (sent.chat.id, sent.message_id)
+    # Только инструкция — без статусов
+    await cq.message.answer("Теперь отправьте фото.\nПосле всех фото нажмите кнопку «📤 Отправить отчёт».")
 
 @dp.callback_query(lambda c: c.data == "cancel")
 async def on_cancel(cq: CallbackQuery):
     await cq.answer()
-    user_sessions.pop(cq.from_user.id, None)
+    sess = user_sessions.pop(cq.from_user.id, None)
+    if sess:
+        clear_summary_task(sess)
     await cq.message.answer("Отменено. Начни заново: /otchet")
 
-# ====== ФОТО: ОДИН СТАТУС НИЖЕ ПОСЛЕДНЕГО ФОТО ======
+# ====== ФОТО: без спама, статус по таймеру тишины ======
 @dp.message(F.photo)
 async def handle_photo(message: Message):
     user_id = message.from_user.id
@@ -160,30 +210,13 @@ async def handle_photo(message: Message):
     # сохраняем фото
     photo = message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
-
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    local_filename = os.path.join(session["tmp_dir"], f"{timestamp}_{photo.file_id}.jpg")
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    local_filename = os.path.join(session["tmp_dir"], f"{ts}_{photo.file_id}.jpg")
     await bot.download_file(file_info.file_path, destination=local_filename)
-
     session["files"].append(local_filename)
 
-    # пересобираем текст статуса
-    total = len(session["files"])
-    status_text = (
-        f"Фото принято ✅  Всего: {total} шт.\n\n"
-        f"Когда закончите — нажмите кнопку ниже, чтобы отправить отчёт."
-    )
-
-    # удаляем старый статус, создаём новый — так он всегда окажется ПОД последним фото
-    if session.get("status_msg"):
-        chat_id, msg_id = session["status_msg"]
-        try:
-            await bot.delete_message(chat_id, msg_id)
-        except Exception:
-            pass
-
-    sent = await message.answer(status_text, reply_markup=build_send_keyboard())
-    session["status_msg"] = (sent.chat.id, sent.message_id)
+    # планируем ОДИН статус после паузы
+    await schedule_summary_message(message, user_id)
 
 # ====== ОТПРАВИТЬ ОТЧЁТ ======
 @dp.callback_query(lambda c: c.data == "confirm_upload")
@@ -195,18 +228,20 @@ async def on_confirm_upload(cq: CallbackQuery):
         await cq.message.answer("Нет фото для загрузки. Отправьте фото или вызовите /otchet.")
         return
 
-    # показать «идёт загрузка» как новое сообщение, удалить статус
+    # убираем статус и таймер
+    clear_summary_task(session)
     if session.get("status_msg"):
         chat_id, msg_id = session["status_msg"]
         try:
             await bot.delete_message(chat_id, msg_id)
         except Exception:
             pass
+        session["status_msg"] = None
 
     loading = await cq.message.answer("Идёт загрузка отчёта на Яндекс.Диск... Пожалуйста, подождите.")
 
     store = session["store"]
-    files = list(session["files"])  # копия
+    files = list(session["files"])
     week_folder = get_week_folder()
     base = YANDEX_BASE
     week_path = f"{base}/{week_folder}"
@@ -225,7 +260,7 @@ async def on_confirm_upload(cq: CallbackQuery):
                     os.remove(local_file)
                 except Exception:
                     pass
-        # убрать пустую временную папку
+        # удалить пустую временную папку
         try:
             tmpdir = session.get("tmp_dir")
             if tmpdir and os.path.isdir(tmpdir) and not os.listdir(tmpdir):
@@ -234,10 +269,9 @@ async def on_confirm_upload(cq: CallbackQuery):
             pass
         return uploaded, len(files)
 
-    loop = asyncio.get_event_loop()  # Py3.8-совместимый offload
+    loop = asyncio.get_event_loop()  # совместимо с Python 3.8
     uploaded, total = await loop.run_in_executor(None, do_upload)
 
-    # финал отдельным сообщением, «loading» удаляем
     try:
         await bot.delete_message(loading.chat.id, loading.message_id)
     except Exception:
@@ -250,7 +284,6 @@ async def on_confirm_upload(cq: CallbackQuery):
     )
     await cq.message.answer(final_text)
 
-    # очистить сессию
     user_sessions.pop(user_id, None)
 
 # ====== ЗАПУСК ======
