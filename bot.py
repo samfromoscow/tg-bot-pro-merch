@@ -1,4 +1,4 @@
-# bot.py — полный готовый код
+# bot.py — полный готовый код (под Python 3.8)
 import os
 import re
 import asyncio
@@ -19,7 +19,7 @@ from aiogram.filters import Command
 TELEGRAM_TOKEN = "8306801846:AAEvDQFoiepNmDaxPi5UVDqiNWmz6tUO_KQ"
 YANDEX_TOKEN = "y0__xCmksrUBxjjojogmLvAsxTMieHo_qAobIbgob8lZd-uDHpoew"
 
-# ====== ЛОГИ И БОТ ======
+# ====== ЛОГИ ======
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -43,11 +43,11 @@ STORES = [
     "ОБИ 108 Казань",
 ]
 
-# База папки на Яндекс.Диске
+# Папка на Яндекс.Диске
 YANDEX_BASE = "/Sam/Проект Crown/Фотоотчеты CROWN"
 
-# Сессии пользователей: user_id -> { store, files: [paths], status_msg: (chat_id, message_id) }
-user_sessions = {}
+# Сессии пользователей
+user_sessions = {}  # type: dict[int, dict]
 
 # ====== УТИЛИТЫ (Yandex) ======
 def ensure_folder_exists(folder_path: str) -> bool:
@@ -72,7 +72,6 @@ def upload_to_yandex(local_file: str, remote_path: str) -> bool:
             return False
         upload_url = resp.json().get("href")
         if not upload_url:
-            logging.error("No href in response")
             return False
         with open(local_file, "rb") as f:
             r = requests.put(upload_url, files={"file": f}, timeout=60)
@@ -81,7 +80,7 @@ def upload_to_yandex(local_file: str, remote_path: str) -> bool:
         logging.exception("upload_to_yandex error")
         return False
 
-def get_week_folder(dt=None) -> str:
+def get_week_folder(dt: datetime = None) -> str:
     if dt is None:
         dt = datetime.now()
     start = dt - timedelta(days=dt.weekday())
@@ -93,7 +92,6 @@ def build_stores_keyboard() -> InlineKeyboardMarkup:
     def store_key(s: str) -> int:
         nums = re.findall(r"\d+", s)
         return int(nums[-1]) if nums else 0
-
     sorted_stores = sorted(STORES, key=store_key)
     buttons = [InlineKeyboardButton(text=s, callback_data=f"store:{s}") for s in sorted_stores]
     rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
@@ -112,12 +110,12 @@ async def cmd_start(message: Message):
 @dp.message(Command("отчет"))
 async def cmd_report(message: Message):
     user_sessions.pop(message.from_user.id, None)
-    await message.answer("Выберите магазин (нажми кнопку):", reply_markup=build_stores_keyboard())
+    await message.answer("Выберите магазин:", reply_markup=build_stores_keyboard())
 
 @dp.message(Command("отмена"))
 async def cmd_cancel(message: Message):
     user_sessions.pop(message.from_user.id, None)
-    await message.answer("Сессия отменена. Если нужно — начните /отчет заново.")
+    await message.answer("Сессия отменена. Начните заново с /отчет.")
 
 # ====== ВЫБОР МАГАЗИНА ======
 @dp.callback_query(lambda c: c.data and c.data.startswith("store:"))
@@ -132,12 +130,8 @@ async def process_store_choice(cq: CallbackQuery):
         "tmp_dir": os.path.join("tmp_reports", str(user_id)),
     }
     os.makedirs(user_sessions[user_id]["tmp_dir"], exist_ok=True)
-
-    await cq.message.answer(
-        f"Вы выбрали магазин:\n<b>{store}</b>\n\nТеперь отправьте фото. После всех фото нажмите кнопку «📤 Отправить отчёт».",
-        reply_markup=None,
-        parse_mode="HTML",
-    )
+    await cq.message.answer(f"Вы выбрали магазин:\n<b>{store}</b>\n\nТеперь отправьте фото.",
+                            parse_mode="HTML")
 
 @dp.callback_query(lambda c: c.data == "cancel")
 async def on_cancel(cq: CallbackQuery):
@@ -151,7 +145,7 @@ async def handle_photo(message: Message):
     user_id = message.from_user.id
     session = user_sessions.get(user_id)
     if not session:
-        await message.answer("Пожалуйста, сначала вызови /отчет и выбери магазин.")
+        await message.answer("Сначала вызови /отчет и выбери магазин.")
         return
 
     photo = message.photo[-1]
@@ -161,12 +155,11 @@ async def handle_photo(message: Message):
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     local_filename = os.path.join(tmp_dir, f"{timestamp}_{photo.file_id}.jpg")
-
     await bot.download_file(file_info.file_path, destination=local_filename)
-    session["files"].append(local_filename)
 
+    session["files"].append(local_filename)
     total = len(session["files"])
-    status_text = f"Фото принято ✅  Всего: {total} шт.\n\nКогда закончите — нажмите кнопку ниже, чтобы отправить отчёт."
+    status_text = f"Фото принято ✅ Всего: {total}\n\nКогда закончите — нажмите кнопку ниже."
 
     if not session.get("status_msg"):
         sent = await message.answer(status_text, reply_markup=build_single_send_keyboard())
@@ -174,32 +167,27 @@ async def handle_photo(message: Message):
     else:
         chat_id, msg_id = session["status_msg"]
         try:
-            await bot.edit_message_text(
-                text=status_text,
-                chat_id=chat_id,
-                message_id=msg_id,
-                reply_markup=build_single_send_keyboard()
-            )
+            await bot.edit_message_text(status_text, chat_id=chat_id, message_id=msg_id,
+                                        reply_markup=build_single_send_keyboard())
         except Exception:
             sent = await message.answer(status_text, reply_markup=build_single_send_keyboard())
             session["status_msg"] = (sent.chat.id, sent.message_id)
 
-# ====== ОТПРАВКА НА ЯНДЕКС ======
+# ====== КНОПКА "Отправить отчёт" ======
 @dp.callback_query(lambda c: c.data == "confirm_upload")
 async def on_confirm_upload(cq: CallbackQuery):
     await cq.answer()
     user_id = cq.from_user.id
     session = user_sessions.get(user_id)
     if not session or not session.get("files"):
-        await cq.message.answer("Нет фото для загрузки. Отправьте фото или вызовите /отчет.")
+        await cq.message.answer("Нет фото для загрузки.")
         return
 
     chat_id, msg_id = session.get("status_msg", (cq.message.chat.id, cq.message.message_id))
-    uploading_text = "Идёт загрузка отчёта на Яндекс.Диск... Пожалуйста, подождите."
     try:
-        await bot.edit_message_text(text=uploading_text, chat_id=chat_id, message_id=msg_id)
+        await bot.edit_message_text("Загрузка отчёта на Яндекс.Диск...", chat_id=chat_id, message_id=msg_id)
     except Exception:
-        await cq.message.answer(uploading_text)
+        pass
 
     store = session["store"]
     files = list(session["files"])
@@ -215,8 +203,7 @@ async def on_confirm_upload(cq: CallbackQuery):
         ensure_folder_exists(store_path)
         for local_file in files:
             remote_path = f"{store_path}/{os.path.basename(local_file)}"
-            ok = upload_to_yandex(local_file, remote_path)
-            if ok:
+            if upload_to_yandex(local_file, remote_path):
                 results["uploaded"] += 1
                 try:
                     os.remove(local_file)
@@ -230,15 +217,13 @@ async def on_confirm_upload(cq: CallbackQuery):
             pass
         return results
 
-    results = await asyncio.to_thread(do_upload)
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(None, do_upload)
     user_sessions.pop(user_id, None)
 
-    final_text = (
-        f"Загрузка завершена.\n✅ Успешно загружено: {results['uploaded']} из {results['total']}.\n"
-        f"Папка: {store_path}"
-    )
+    final_text = f"Загрузка завершена.\n✅ Успешно: {results['uploaded']} из {results['total']}.\nПапка: {store_path}"
     try:
-        await bot.edit_message_text(text=final_text, chat_id=chat_id, message_id=msg_id)
+        await bot.edit_message_text(final_text, chat_id=chat_id, message_id=msg_id)
     except Exception:
         await cq.message.answer(final_text)
 
