@@ -1,269 +1,117 @@
-# bot.py — полный готовый код
-import os
-import re
-import asyncio
 import logging
+import os
 import requests
-from datetime import datetime, timedelta
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
+from aiogram.types import Message
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime
+from typing import Dict
 
-# ======= ТОКЕНЫ (оставлены как есть) =======
+# ==============================
+# 🔑 ТВОИ ТОКЕНЫ
+# ==============================
 TELEGRAM_TOKEN = "8306801846:AAEvDQFoiepNmDaxPi5UVDqiNWmz6tUO_KQ"
 YANDEX_TOKEN = "y0__xCmksrUBxjjojogmLvAsxTMieHo_qAobIbgob8lZd-uDHpoew"
 
-# ====== ЛОГИ И БОТ ======
+# Папка для временных файлов
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Логирование
 logging.basicConfig(level=logging.INFO)
+
+# Сессии пользователей
+user_sessions: Dict[int, dict] = {}
+
+# Бот и диспетчер
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# ====== Список магазинов ======
-STORES = [
-    "ОБИ 013 Белая дача",
-    "ОБИ 009 Варшавка",
-    "ОБИ 017 Новгород",
-    "ОБИ 006 Боровка",
-    "ОБИ 037 Авиапарк",
-    "ОБИ 039 Новая Рига",
-    "ОБИ 033 Рязань",
-    "ОБИ 023 Волгоград",
-    "ОБИ 042 Брянск",
-    "ОБИ 015 Парнас",
-    "ОБИ 001 Теплый стан",
-    "ОБИ 011 Федяково",
-    "ОБИ 016 Лахта",
-    "ОБИ 035 Митино",
-    "ОБИ 108 Казань",
-]
 
-# База папки на Яндекс.Диске (как просили)
-YANDEX_BASE = "/Sam/Проект Crown/Фотоотчеты CROWN"
-
-# Сессии пользователей: user_id -> { store, files: [paths], status_msg: (chat_id, message_id) }
-user_sessions: dict[int, dict] = {}
-
-# ====== УТИЛИТЫ (Yandex) ======
-def ensure_folder_exists(folder_path: str) -> bool:
-    """Создать папку на Яндекс.Диске если не существует."""
-    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
-    url = "https://cloud-api.yandex.net/v1/disk/resources"
-    params = {"path": folder_path}
-    try:
-        r = requests.put(url, headers=headers, params=params, timeout=30)
-        return r.status_code in (201, 409)
-    except Exception as e:
-        logging.exception("ensure_folder_exists error")
-        return False
-
-def upload_to_yandex(local_file: str, remote_path: str) -> bool:
-    """Загрузить локальный файл на Яндекс.Диск (blocking)."""
-    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
-    url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
-    params = {"path": remote_path, "overwrite": "true"}
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        if resp.status_code != 200:
-            logging.error("Get upload href failed %s %s", resp.status_code, resp.text)
-            return False
-        upload_url = resp.json().get("href")
-        if not upload_url:
-            logging.error("No href in response")
-            return False
-        with open(local_file, "rb") as f:
-            r = requests.put(upload_url, files={"file": f}, timeout=60)
-        success = r.status_code in (201, 202)
-        if not success:
-            logging.error("Upload failed %s %s", r.status_code, r.text)
-        return success
-    except Exception:
-        logging.exception("upload_to_yandex error")
-        return False
-
-def get_week_folder(dt: datetime | None = None) -> str:
-    """Вернуть название папки недели в формате DD.MM-DD.MM (понедельник-воскресенье)."""
-    if dt is None:
-        dt = datetime.now()
-    # считаем понедельник как начало недели
-    start = dt - timedelta(days=dt.weekday())
-    end = start + timedelta(days=6)
-    return f"{start.day:02}.{start.month:02}-{end.day:02}.{end.month:02}"
-
-# ====== КЛАВИАТУРЫ ======
-def build_stores_keyboard() -> InlineKeyboardMarkup:
-    """Собираем клавиатуру магазинов (3 в ряд) + Отмена."""
-    def store_key(s: str) -> int:
-        nums = re.findall(r"\d+", s)
-        return int(nums[-1]) if nums else 0
-
-    sorted_stores = sorted(STORES, key=store_key)
-    buttons = [
-        InlineKeyboardButton(text=s, callback_data=f"store:{s}")
-        for s in sorted_stores
-    ]
-    rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
-    # Кнопка отмены внизу одной строкой
-    rows.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def build_single_send_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура с одной кнопкой 'Отправить отчёт'."""
-    btn = InlineKeyboardButton(text="📤 Отправить отчёт", callback_data="confirm_upload")
-    return InlineKeyboardMarkup(inline_keyboard=[[btn]])
-
-# ====== КОМАНДЫ ======
+# ==============================
+# 📥 Прием команд
+# ==============================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("Привет! 👋 Для отправки фотоотчёта используй команду /отчет")
+    await message.answer("Привет 👋 Отправь мне фото, и я загружу его на Яндекс.Диск 📂")
 
-@dp.message(Command("отчет"))
-async def cmd_report(message: Message):
-    # очищаем сессию, если была
-    user_sessions.pop(message.from_user.id, None)
-    await message.answer("Выберите магазин (нажми кнопку):", reply_markup=build_stores_keyboard())
 
-@dp.message(Command("отмена"))
-async def cmd_cancel(message: Message):
-    user_sessions.pop(message.from_user.id, None)
-    await message.answer("Сессия отменена. Если нужно — начните /отчет заново.")
-
-# ====== ВЫБОР МАГАЗИНА ======
-@dp.callback_query(lambda c: c.data and c.data.startswith("store:"))
-async def process_store_choice(cq: CallbackQuery):
-    await cq.answer()
-    user_id = cq.from_user.id
-    store = cq.data.split(":", 1)[1]
-    # создаём сессию
-    user_sessions[user_id] = {
-        "store": store,
-        "files": [],
-        "status_msg": None,  # (chat_id, message_id)
-        "tmp_dir": os.path.join("tmp_reports", str(user_id)),
-    }
-    os.makedirs(user_sessions[user_id]["tmp_dir"], exist_ok=True)
-
-    await cq.message.answer(
-        f"Вы выбрали магазин:\n<b>{store}</b>\n\nТеперь отправьте фото. После всех фото нажмите кнопку «📤 Отправить отчёт».",
-        reply_markup=None,
-        parse_mode="HTML",
-    )
-
-@dp.callback_query(lambda c: c.data == "cancel")
-async def on_cancel(cq: CallbackQuery):
-    await cq.answer()
-    user_sessions.pop(cq.from_user.id, None)
-    await cq.message.answer("Отмена выбора. Сессия очищена.")
-
-# ====== ОБРАБОТКА ФОТО (ЕДИНОЕ СООБЩЕНИЕ СТАТУСА) ======
-@dp.message(F.photo)
+@dp.message(lambda msg: msg.photo)
 async def handle_photo(message: Message):
     user_id = message.from_user.id
-    session = user_sessions.get(user_id)
-    if not session:
-        await message.answer("Пожалуйста, сначала вызови /отчет и выбери магазин.")
-        return
+    session = user_sessions.setdefault(user_id, {"photos": []})
 
-    photo = message.photo[-1]
-    file_info = await bot.get_file(photo.file_id)
-    tmp_dir = session["tmp_dir"]
-    os.makedirs(tmp_dir, exist_ok=True)
+    file_id = message.photo[-1].file_id
+    file = await bot.get_file(file_id)
+    file_path = file.file_path
 
-    # === изменённая строка: имя файла теперь с датой загрузки ===
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    local_filename = os.path.join(tmp_dir, f"{timestamp}_{photo.file_id}.jpg")
+    # Сохраняем фото локально
+    local_filename = os.path.join(UPLOAD_DIR, f"{file_id}.jpg")
+    await bot.download_file(file_path, local_filename)
 
-    # Скачиваем файл
-    await bot.download_file(file_info.file_path, destination=local_filename)
+    # Загружаем на Яндекс.Диск
+    remote_filename = f"TelegramReports/{os.path.basename(local_filename)}"
+    success = upload_to_yandex(local_filename, remote_filename)
 
-    # Добавляем в сессию
-    session["files"].append(local_filename)
-
-    # Обновляем статус
-    total = len(session["files"])
-    status_text = f"Фото принято ✅  Всего: {total} шт.\n\nКогда закончите — нажмите кнопку ниже, чтобы отправить отчёт."
-
-    if not session.get("status_msg"):
-        sent = await message.answer(status_text, reply_markup=build_single_send_keyboard())
-        session["status_msg"] = (sent.chat.id, sent.message_id)
+    if success:
+        await message.answer("✅ Фото загружено на Яндекс.Диск!")
     else:
-        chat_id, msg_id = session["status_msg"]
-        try:
-            await bot.edit_message_text(
-                text=status_text,
-                chat_id=chat_id,
-                message_id=msg_id,
-                reply_markup=build_single_send_keyboard()
-            )
-        except Exception:
-            sent = await message.answer(status_text, reply_markup=build_single_send_keyboard())
-            session["status_msg"] = (sent.chat.id, sent.message_id)
+        await message.answer("⚠️ Ошибка при загрузке на Яндекс.Диск.")
 
-# ====== НАЖАТИЕ КНОПКИ "Отправить отчёт" ======
-@dp.callback_query(lambda c: c.data == "confirm_upload")
-async def on_confirm_upload(cq: CallbackQuery):
-    await cq.answer()
-    user_id = cq.from_user.id
-    session = user_sessions.get(user_id)
-    if not session or not session.get("files"):
-        await cq.message.answer("Нет фото для загрузки. Отправьте фото или вызовите /отчет.")
-        return
+    session["photos"].append(local_filename)
 
-    chat_id, msg_id = session.get("status_msg", (cq.message.chat.id, cq.message.message_id))
-    uploading_text = "Идёт загрузка отчёта на Яндекс.Диск... Пожалуйста, подождите."
+
+# ==============================
+# ☁️ Загрузка на Яндекс.Диск
+# ==============================
+def upload_to_yandex(local_path: str, remote_path: str) -> bool:
+    """Загрузка файла на Яндекс.Диск"""
+    url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
+    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
+    params = {"path": remote_path, "overwrite": "true"}
+
     try:
-        await bot.edit_message_text(text=uploading_text, chat_id=chat_id, message_id=msg_id)
-    except Exception:
-        await cq.message.answer(uploading_text)
+        # Запрашиваем ссылку для загрузки
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        href = response.json()["href"]
 
-    store = session["store"]
-    files = list(session["files"])
-    week_folder = get_week_folder()
-    base = YANDEX_BASE
-    week_path = f"{base}/{week_folder}"
-    store_path = f"{week_path}/{store}"
+        # Отправляем файл
+        with open(local_path, "rb") as f:
+            upload_response = requests.put(href, files={"file": f})
+        upload_response.raise_for_status()
 
-    def do_upload():
-        results = {"uploaded": 0, "total": len(files)}
-        ensure_folder_exists(base)
-        ensure_folder_exists(week_path)
-        ensure_folder_exists(store_path)
-        for local_file in files:
-            remote_path = f"{store_path}/{os.path.basename(local_file)}"
-            ok = upload_to_yandex(local_file, remote_path)
-            if ok:
-                results["uploaded"] += 1
-                try:
-                    os.remove(local_file)
-                except Exception:
-                    pass
-        try:
-            tmpdir = session.get("tmp_dir")
-            if tmpdir and os.path.isdir(tmpdir) and not os.listdir(tmpdir):
-                os.rmdir(tmpdir)
-        except Exception:
-            pass
-        return results
+        logging.info(f"✅ Файл {local_path} загружен как {remote_path}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Ошибка загрузки {local_path}: {e}")
+        return False
 
-    results = await asyncio.to_thread(do_upload)
-    user_sessions.pop(user_id, None)
 
-    final_text = (
-        f"Загрузка завершена.\n✅ Успешно загружено: {results['uploaded']} из {results['total']}.\n"
-        f"Папка: {store_path}"
-    )
-    try:
-        await bot.edit_message_text(text=final_text, chat_id=chat_id, message_id=msg_id)
-    except Exception:
-        await cq.message.answer(final_text)
+# ==============================
+# ⏰ Планировщик
+# ==============================
+scheduler = AsyncIOScheduler()
 
-# ====== ЗАПУСК ======
+
+def scheduled_task():
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logging.info(f"⏰ Плановая задача запущена в {now}")
+
+
+scheduler.add_job(scheduled_task, "interval", minutes=10)
+
+
+# ==============================
+# 🚀 Запуск бота
+# ==============================
+async def main():
+    scheduler.start()
+    await dp.start_polling(bot)
+
+
 if __name__ == "__main__":
-    print("✅ Бот запущен и слушает Telegram...")
-    dp.run_polling(bot)
+    import asyncio
 
+    asyncio.run(main())
