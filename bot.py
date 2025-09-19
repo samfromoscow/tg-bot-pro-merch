@@ -103,19 +103,19 @@ def build_single_send_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[btn]])
 
 # ====== КОМАНДЫ ======
-@dp.message(Command("start"))
+# @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("Привет! 👋 Для отправки фотоотчёта используй команду /отчет")
+    await message.answer("Привет! 👋 Для отправки фотоотчёта используй команду /otchet")
 
-@dp.message(Command("отчет"))
+@dp.message(Command("otchet"))
 async def cmd_report(message: Message):
     user_sessions.pop(message.from_user.id, None)
     await message.answer("Выберите магазин:", reply_markup=build_stores_keyboard())
 
-@dp.message(Command("отмена"))
+# @dp.message(Command("отмена"))
 async def cmd_cancel(message: Message):
     user_sessions.pop(message.from_user.id, None)
-    await message.answer("Сессия отменена. Начните заново с /отчет.")
+    await message.answer("Сессия отменена. Начните заново с /otchet.")
 
 # ====== ВЫБОР МАГАЗИНА ======
 @dp.callback_query(lambda c: c.data and c.data.startswith("store:"))
@@ -145,7 +145,7 @@ async def handle_photo(message: Message):
     user_id = message.from_user.id
     session = user_sessions.get(user_id)
     if not session:
-        await message.answer("Сначала вызови /отчет и выбери магазин.")
+        await message.answer("Сначала вызови /otchet и выбери магазин.")
         return
 
     photo = message.photo[-1]
