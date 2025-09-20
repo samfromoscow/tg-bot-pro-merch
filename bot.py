@@ -1,11 +1,11 @@
-# bot.py — без спама, один статус, админ-статус только для владельца
+# bot.py — без спама + admin-only /status
 import os
 import re
 import asyncio
 import logging
 import requests
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -14,15 +14,16 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     BotCommand,
-    BotCommandScopeDefault,
     BotCommandScopeChat,
 )
 from aiogram.filters import Command
 
-# ======= НАСТРОЙКИ / ТОКЕНЫ =======
+# ======= ТОКЕНЫ =======
 TELEGRAM_TOKEN = "8306801846:AAEvDQFoiepNmDaxPi5UVDqiNWmz6tUO_KQ"
 YANDEX_TOKEN   = "y0__xCmksrUBxjjojogmLvAsxTMieHo_qAobIbgob8lZd-uDHpoew"
-ADMIN_ID       = 445526501  # твой Telegram user_id
+
+# ====== АДМИН ======
+ADMIN_ID = 445526501  # только этому пользователю доступна /status и видно её в меню
 
 # ====== ЛОГИ И БОТ ======
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +31,7 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher()
 
 # ====== Константы ======
-SUMMARY_DELAY_SEC = 2.0  # задержка тишины, после которой показываем ОДИН статус
+SUMMARY_DELAY_SEC = 2.0  # пауза тишины, после которой показываем один статус
 
 # ====== Список магазинов ======
 STORES: List[str] = [
@@ -59,7 +60,11 @@ YANDEX_BASE = "/Sam/Проект Crown/Фотоотчеты CROWN"
 #             "status_msg": Optional[Tuple[int,int]], "summary_task": Optional[asyncio.Task]}
 user_sessions: Dict[int, Dict[str, Any]] = {}
 
-# ====== УТИЛИТЫ (Yandex.Disk) ======
+# На всякий случай память об отправивших за неделю (fallback, если API листинга недоступен)
+# submitted_by_week["DD.MM-DD.MM"] = set(store_names)
+submitted_by_week: Dict[str, Set[str]] = {}
+
+# ====== УТИЛИТЫ (Yandex) ======
 def ensure_folder_exists(folder_path: str) -> bool:
     headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
     url = "https://cloud-api.yandex.net/v1/disk/resources"
@@ -91,33 +96,29 @@ def upload_to_yandex(local_file: str, remote_path: str) -> bool:
         logging.exception("upload_to_yandex error")
         return False
 
-def list_folder_items_count(folder_path: str) -> int:
-    """
-    Возвращает количество элементов в папке на Я.Диске.
-    0 — пусто или нет файлов; -1 — ошибка запроса.
+def list_folder_children(folder_path: str) -> List[str]:
+    """Вернуть имена вложенных объектов (папок/файлов) в каталоге на Я.Диске.
+    Используется для определения, какие магазины уже создали папку за неделю.
     """
     headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
     url = "https://cloud-api.yandex.net/v1/disk/resources"
-    params = {"path": folder_path, "limit": 1}
+    params = {
+        "path": folder_path,
+        "limit": 1000,
+        "fields": "_embedded.items.name,_embedded.items.type"
+    }
     try:
         r = requests.get(url, headers=headers, params=params, timeout=30)
-        if r.status_code == 404:
-            return 0
         if r.status_code != 200:
-            logging.error("list_folder_items_count failed %s %s", r.status_code, r.text)
-            return -1
+            logging.warning("list_folder_children %s -> %s %s", folder_path, r.status_code, r.text)
+            return []
         data = r.json()
-        # Если папка, в _embedded.items список содержимого; если файла нет — 0
-        embedded = data.get("_embedded", {})
-        items = embedded.get("items", [])
-        # Если limit=1, но total скажет реальное количество
-        total = embedded.get("total")
-        if isinstance(total, int):
-            return total
-        return len(items)
+        items = data.get("_embedded", {}).get("items", [])
+        # возвращаем имена только папок
+        return [it.get("name") for it in items if it.get("type") == "dir"]
     except Exception:
-        logging.exception("list_folder_items_count error")
-        return -1
+        logging.exception("list_folder_children error")
+        return []
 
 def get_week_folder(now: Optional[datetime] = None) -> str:
     if now is None:
@@ -142,12 +143,9 @@ def build_send_keyboard() -> InlineKeyboardMarkup:
     btn = InlineKeyboardButton(text="📤 Отправить отчёт", callback_data="confirm_upload")
     return InlineKeyboardMarkup(inline_keyboard=[[btn]])
 
-# ====== ХЭЛПЕРЫ (статус-сообщение) ======
+# ====== ХЭЛПЕРЫ ======
 async def schedule_summary_message(message: Message, user_id: int):
-    """
-    Планирует показ ОДНОГО статус-сообщения после паузы SUMMARY_DELAY_SEC.
-    Если в этот момент уже есть статус — просто редактируем его.
-    """
+    """Планирует показ ОДНОГО статус-сообщения после паузы SUMMARY_DELAY_SEC."""
     session = user_sessions.get(user_id)
     if not session:
         return
@@ -184,7 +182,6 @@ async def schedule_summary_message(message: Message, user_id: int):
                 sent = await message.answer(text, reply_markup=kb)
                 sess["status_msg"] = (sent.chat.id, sent.message_id)
         except asyncio.CancelledError:
-            # таймер сброшен новой фоткой — молча выходим
             return
 
     session["summary_task"] = asyncio.create_task(delayed())
@@ -194,7 +191,7 @@ def clear_summary_task(session: Dict[str, Any]):
     if task and not task.done():
         task.cancel()
 
-# ====== КОМАНДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ======
+# ====== КОМАНДЫ ПОЛЬЗОВАТЕЛЕЙ ======
 @dp.message(Command("otchet"))
 async def cmd_report(message: Message):
     # новая чистая сессия
@@ -304,6 +301,10 @@ async def on_confirm_upload(cq: CallbackQuery):
     loop = asyncio.get_event_loop()  # совместимо с Python 3.8
     uploaded, total = await loop.run_in_executor(None, do_upload)
 
+    # пометим, что у этого магазина есть отчёт на этой неделе
+    if uploaded > 0:
+        submitted_by_week.setdefault(week_folder, set()).add(store)
+
     try:
         await bot.delete_message(loading.chat.id, loading.message_id)
     except Exception:
@@ -318,60 +319,55 @@ async def on_confirm_upload(cq: CallbackQuery):
 
     user_sessions.pop(user_id, None)
 
-# ====== АДМИН-КОМАНДА /status (видна и доступна только ADMIN_ID) ======
+# ====== АДМИН /status ======
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     if message.from_user.id != ADMIN_ID:
-        # Тихо игнорируем или отвечаем мягко:
-        return  # или: await message.answer("Команда недоступна.")
-    week_folder = get_week_folder()
-    base = YANDEX_BASE
-    week_path = f"{base}/{week_folder}"
+        # Молча игнорируем или можно ответить:
+        await message.answer("Эта команда недоступна.")
+        return
 
-    # Если недели нет — никто не отправлял
-    total_missing = []
-    total_ok = []
-    for store in STORES:
-        store_path = f"{week_path}/{store}"
-        count = list_folder_items_count(store_path)
-        if count > 0:
-            total_ok.append(store)
-        else:
-            total_missing.append(store)
+    week = get_week_folder()
+    week_path = f"{YANDEX_BASE}/{week}"
+
+    # пробуем получить магазины с отчётами из Я.Диска (папки внутри week_path)
+    existing_dirs = set(list_folder_children(week_path))
+    if not existing_dirs:
+        # fallback к памяти если API недоступен/пусто
+        existing_dirs = submitted_by_week.get(week, set())
+
+    total = len(STORES)
+    done = sorted([s for s in STORES if s in existing_dirs])
+    missing = sorted([s for s in STORES if s not in existing_dirs])
 
     text_lines = [
-        f"📊 Статус отчётов за неделю {week_folder}",
-        f"✅ Отчитались: {len(total_ok)}",
-        f"❌ Не отчитались: {len(total_missing)}",
-        "",
+        f"📆 Неделя: {week}",
+        f"✅ Отчёты получены: {len(done)} / {total}",
     ]
-    if total_missing:
-        text_lines.append("Список без отчёта:")
-        for s in total_missing:
+    if missing:
+        text_lines.append("\n❌ Не прислали:")
+        # ограничим сообщение, если список длинный
+        for s in missing:
             text_lines.append(f"• {s}")
+    else:
+        text_lines.append("\n🎉 Все магазины прислали отчёт!")
 
     await message.answer("\n".join(text_lines))
 
-# ====== УСТАНОВКА МЕНЮ КОМАНД ======
-async def _set_scoped_commands():
-    # Меню по умолчанию для всех: только /otchet
-    await bot.set_my_commands(
-        [BotCommand(command="otchet", description="Отправить фотоотчёт")],
-        scope=BotCommandScopeDefault(),
-    )
-    # Меню только для тебя в личке с ботом: /otchet и /status
-    await bot.set_my_commands(
-        [
-            BotCommand(command="otchet", description="Отправить фотоотчёт"),
-            BotCommand(command="status", description="Статус отчётов (админ)"),
-        ],
-        scope=BotCommandScopeChat(chat_id=ADMIN_ID),
-    )
+# ====== on_startup: админ-меню только для 445526501 ======
+async def on_startup(bot: Bot):
+    try:
+        await bot.set_my_commands(
+            commands=[
+                BotCommand(command="otchet", description="Начать отчёт"),
+                BotCommand(command="status", description="Статус отчётов"),
+            ],
+            scope=BotCommandScopeChat(chat_id=ADMIN_ID),
+        )
+    except Exception as e:
+        logging.warning("Can't set admin-only menu: %s", e)
 
-async def _on_startup():
-    await _set_scoped_commands()
-
-dp.startup.register(_on_startup)
+dp.startup.register(on_startup)
 
 # ====== ЗАПУСК ======
 if __name__ == "__main__":
