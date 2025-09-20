@@ -1,37 +1,37 @@
-# bot.py — без спама + админ /status для проверки, кто ещё не сдал
+# bot.py — без спама + /status только у админа и видно только ему в меню
 import os
 import re
 import asyncio
 import logging
 import requests
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
 from aiogram.filters import Command
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand,
+    BotCommandScopeDefault, BotCommandScopeChat,
+    BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats,
+    BotCommandScopeAllChatAdministrators,
+)
 
-# ======= ТОКЕНЫ =======
+# ======= КОНФИГ =======
+ADMIN_ID = 445526501  # ← твой Telegram ID (видит/может /status)
 TELEGRAM_TOKEN = "8306801846:AAEvDQFoiepNmDaxPi5UVDqiNWmz6tUO_KQ"
 YANDEX_TOKEN   = "y0__xCmksrUBxjjojogmLvAsxTMieHo_qAobIbgob8lZd-uDHpoew"
 
-# ====== АДМИН ======
-ADMIN_ID = 445526501  # твой Telegram user_id
+SUMMARY_DELAY_SEC = 2.0  # задержка тишины перед показом ОДНОГО статуса
+YANDEX_BASE = "/Sam/Проект Crown/Фотоотчеты CROWN"
 
-# ====== ЛОГИ И БОТ ======
+# ======= ЛОГИ И БОТ =======
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher()
 
-# ====== Константы ======
-SUMMARY_DELAY_SEC = 2.0  # задержка тишины, после которой показываем ОДИН статус
-
-# ====== Список магазинов ======
+# ======= Справочник магазинов =======
 STORES: List[str] = [
     "ОБИ 013 Белая дача",
     "ОБИ 009 Варшавка",
@@ -50,70 +50,12 @@ STORES: List[str] = [
     "ОБИ 108 Казань",
 ]
 
-# База папки на Яндекс.Диске
-YANDEX_BASE = "/Sam/Проект Crown/Фотоотчеты CROWN"
-
-# Сессии пользователей
+# ======= Сессии =======
 # user_id -> {"store": str, "files": List[str], "tmp_dir": str,
 #             "status_msg": Optional[Tuple[int,int]], "summary_task": Optional[asyncio.Task]}
 user_sessions: Dict[int, Dict[str, Any]] = {}
 
-# ====== УТИЛИТЫ (Yandex) ======
-def ensure_folder_exists(folder_path: str) -> bool:
-    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
-    url = "https://cloud-api.yandex.net/v1/disk/resources"
-    params = {"path": folder_path}
-    try:
-        r = requests.put(url, headers=headers, params=params, timeout=30)
-        return r.status_code in (201, 409)
-    except Exception:
-        logging.exception("ensure_folder_exists error")
-        return False
-
-def upload_to_yandex(local_file: str, remote_path: str) -> bool:
-    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
-    url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
-    params = {"path": remote_path, "overwrite": "true"}
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        if resp.status_code != 200:
-            logging.error("Get upload href failed %s %s", resp.status_code, resp.text)
-            return False
-        upload_url = resp.json().get("href")
-        if not upload_url:
-            logging.error("No href in response")
-            return False
-        with open(local_file, "rb") as f:
-            r = requests.put(upload_url, files={"file": f}, timeout=120)
-        return r.status_code in (201, 202)
-    except Exception:
-        logging.exception("upload_to_yandex error")
-        return False
-
-def yandex_list_dir(path: str) -> List[dict]:
-    """Вернёт список элементов папки (пустой список, если нет папки/ошибка)."""
-    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
-    url = "https://cloud-api.yandex.net/v1/disk/resources"
-    params = {"path": path, "limit": 1000}
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=30)
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("_embedded", {}).get("items", []) or []
-        elif r.status_code == 404:
-            return []
-        else:
-            logging.error("yandex_list_dir %s %s", r.status_code, r.text)
-            return []
-    except Exception:
-        logging.exception("yandex_list_dir error")
-        return []
-
-def yandex_count_files(path: str) -> int:
-    """Считает файлы только в этой папке (без рекурсии)."""
-    items = yandex_list_dir(path)
-    return sum(1 for it in items if it.get("type") == "file")
-
+# ======= Утилиты: неделя, Я.Диск =======
 def get_week_folder(now: Optional[datetime] = None) -> str:
     if now is None:
         now = datetime.now()
@@ -121,33 +63,73 @@ def get_week_folder(now: Optional[datetime] = None) -> str:
     end = start + timedelta(days=6)
     return f"{start.day:02}.{start.month:02}-{end.day:02}.{end.month:02}"
 
-# ====== КЛАВИАТУРЫ ======
+def y_headers() -> Dict[str, str]:
+    return {"Authorization": f"OAuth {YANDEX_TOKEN}"}
+
+def ensure_folder_exists(path: str) -> bool:
+    url = "https://cloud-api.yandex.net/v1/disk/resources"
+    try:
+        r = requests.put(url, headers=y_headers(), params={"path": path}, timeout=30)
+        return r.status_code in (201, 409)
+    except Exception:
+        logging.exception("ensure_folder_exists error")
+        return False
+
+def upload_to_yandex(local_file: str, remote_path: str) -> bool:
+    get_url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
+    try:
+        resp = requests.get(get_url, headers=y_headers(),
+                            params={"path": remote_path, "overwrite": "true"},
+                            timeout=30)
+        if resp.status_code != 200:
+            logging.error("Get href failed: %s %s", resp.status_code, resp.text)
+            return False
+        href = resp.json().get("href")
+        if not href:
+            return False
+        with open(local_file, "rb") as f:
+            put = requests.put(href, files={"file": f}, timeout=120)
+        return put.status_code in (201, 202)
+    except Exception:
+        logging.exception("upload_to_yandex error")
+        return False
+
+def yandex_list_count(path: str) -> int:
+    """Кол-во объектов в папке (0 если нет/пусто)."""
+    url = "https://cloud-api.yandex.net/v1/disk/resources"
+    try:
+        r = requests.get(url, headers=y_headers(), params={"path": path, "limit": 2000}, timeout=30)
+        if r.status_code != 200:
+            return 0
+        items = r.json().get("_embedded", {}).get("items", [])
+        return len(items)
+    except Exception:
+        logging.exception("yandex_list_count error")
+        return 0
+
+# ======= Клавиатуры =======
 def build_stores_keyboard() -> InlineKeyboardMarkup:
     def store_key(s: str) -> int:
         nums = re.findall(r"\d+", s)
         return int(nums[-1]) if nums else 0
-
-    sorted_stores = sorted(STORES, key=store_key)
-    buttons = [InlineKeyboardButton(text=s, callback_data=f"store:{s}") for s in sorted_stores]
+    buttons = [InlineKeyboardButton(text=s, callback_data=f"store:{s}")
+               for s in sorted(STORES, key=store_key)]
     rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
     rows.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def build_send_keyboard() -> InlineKeyboardMarkup:
-    btn = InlineKeyboardButton(text="📤 Отправить отчёт", callback_data="confirm_upload")
-    return InlineKeyboardMarkup(inline_keyboard=[[btn]])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="📤 Отправить отчёт", callback_data="confirm_upload")]]
+    )
 
-# ====== ХЭЛПЕРЫ ======
+# ======= Помощники анти-спама =======
 async def schedule_summary_message(message: Message, user_id: int):
-    """
-    Планирует показ ОДНОГО статус-сообщения после паузы SUMMARY_DELAY_SEC.
-    Если в этот момент уже есть статус — просто редактируем его.
-    """
     session = user_sessions.get(user_id)
     if not session:
         return
 
-    # отменяем предыдущий таймер, если есть
+    # отменяем прошлый таймер
     task: Optional[asyncio.Task] = session.get("summary_task")
     if task and not task.done():
         task.cancel()
@@ -179,7 +161,6 @@ async def schedule_summary_message(message: Message, user_id: int):
                 sent = await message.answer(text, reply_markup=kb)
                 sess["status_msg"] = (sent.chat.id, sent.message_id)
         except asyncio.CancelledError:
-            # таймер сброшен новой фоткой — молча выходим
             return
 
     session["summary_task"] = asyncio.create_task(delayed())
@@ -189,17 +170,44 @@ def clear_summary_task(session: Dict[str, Any]):
     if task and not task.done():
         task.cancel()
 
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-# ====== КОМАНДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ======
+# ======= Команды =======
 @dp.message(Command("otchet"))
 async def cmd_report(message: Message):
-    # новая чистая сессия
     user_sessions.pop(message.from_user.id, None)
     await message.answer("Выберите магазин (нажми кнопку):", reply_markup=build_stores_keyboard())
 
-# ====== ВЫБОР МАГАЗИНА ======
+# Только в твоём меню и только для тебя доступна:
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        # Для остальных команда недоступна (и не видна в меню)
+        await message.answer("Команда недоступна.")
+        return
+
+    week = get_week_folder()
+    week_path = f"{YANDEX_BASE}/{week}"
+
+    uploaded_stores: List[str] = []
+    for s in STORES:
+        store_path = f"{week_path}/{s}"
+        if yandex_list_count(store_path) > 0:
+            uploaded_stores.append(s)
+
+    not_uploaded = [s for s in STORES if s not in uploaded_stores]
+    count_done = len(uploaded_stores)
+    total = len(STORES)
+
+    lines = [f"Статус отчётов за неделю {week}",
+             f"Сдали: {count_done} из {total}", ""]
+    if not_uploaded:
+        lines.append("Ещё не сдали:")
+        for s in not_uploaded:
+            lines.append(f"• {s}")
+    else:
+        lines.append("✅ Все магазины сдали отчёт!")
+    await message.answer("\n".join(lines))
+
+# ======= Выбор магазина =======
 @dp.callback_query(lambda c: c.data and c.data.startswith("store:"))
 async def process_store_choice(cq: CallbackQuery):
     await cq.answer()
@@ -213,11 +221,10 @@ async def process_store_choice(cq: CallbackQuery):
         "store": store,
         "files": [],
         "tmp_dir": tmp_dir,
-        "status_msg": None,        # (chat_id, message_id)
-        "summary_task": None,      # asyncio.Task
+        "status_msg": None,
+        "summary_task": None,
     }
 
-    # Только инструкция — без статусов
     await cq.message.answer("Теперь отправьте фото.\nПосле всех фото нажмите кнопку «📤 Отправить отчёт».")
 
 @dp.callback_query(lambda c: c.data == "cancel")
@@ -228,7 +235,7 @@ async def on_cancel(cq: CallbackQuery):
         clear_summary_task(sess)
     await cq.message.answer("Отменено. Начни заново: /otchet")
 
-# ====== ФОТО: без спама, статус по таймеру тишины ======
+# ======= Приём фото (анти-спам статуса) =======
 @dp.message(F.photo)
 async def handle_photo(message: Message):
     user_id = message.from_user.id
@@ -245,10 +252,10 @@ async def handle_photo(message: Message):
     await bot.download_file(file_info.file_path, destination=local_filename)
     session["files"].append(local_filename)
 
-    # планируем ОДИН статус после паузы
+    # показываем ОДИН статус по таймеру тишины
     await schedule_summary_message(message, user_id)
 
-# ====== ОТПРАВИТЬ ОТЧЁТ ======
+# ======= Отправка отчёта =======
 @dp.callback_query(lambda c: c.data == "confirm_upload")
 async def on_confirm_upload(cq: CallbackQuery):
     await cq.answer()
@@ -258,7 +265,7 @@ async def on_confirm_upload(cq: CallbackQuery):
         await cq.message.answer("Нет фото для загрузки. Отправьте фото или вызовите /otchet.")
         return
 
-    # убираем статус и таймер
+    # убрать статус и таймер
     clear_summary_task(session)
     if session.get("status_msg"):
         chat_id, msg_id = session["status_msg"]
@@ -299,7 +306,7 @@ async def on_confirm_upload(cq: CallbackQuery):
             pass
         return uploaded, len(files)
 
-    loop = asyncio.get_event_loop()  # совместимо с Python 3.8
+    loop = asyncio.get_event_loop()  # Py3.8 совместимо
     uploaded, total = await loop.run_in_executor(None, do_upload)
 
     try:
@@ -316,46 +323,32 @@ async def on_confirm_upload(cq: CallbackQuery):
 
     user_sessions.pop(user_id, None)
 
-# ====== АДМИН-КОМАНДА /status ======
-@dp.message(Command("status"))
-async def cmd_status(message: Message):
-    if not is_admin(message.from_user.id):
-        return  # для остальных — тишина, будто команды нет
-
-    week_folder = get_week_folder()
-    week_path = f"{YANDEX_BASE}/{week_folder}"
-
-    def build_missing_report():
-        missing: List[str] = []
-        submitted: List[str] = []
-        for store in STORES:
-            path = f"{week_path}/{store}"
-            cnt = yandex_count_files(path)
-            if cnt > 0:
-                submitted.append(f"{store} — {cnt} файл(ов)")
-            else:
-                missing.append(store)
-        return missing, submitted
-
-    loop = asyncio.get_event_loop()
-    missing, submitted = await loop.run_in_executor(None, build_missing_report)
-
-    total = len(STORES)
-    done = total - len(missing)
-
-    if missing:
-        missing_text = "\n".join(f"• {s}" for s in missing)
-    else:
-        missing_text = "— нет, все сдали 🎉"
-
-    text = (
-        f"<b>Статус отчётов за неделю {week_folder}</b>\n"
-        f"Сдали: <b>{done}</b> из <b>{total}</b>\n\n"
-        f"<b>Ещё не сдали:</b>\n{missing_text}"
+# ======= Настройка команд в меню =======
+async def setup_commands():
+    # 1) Для всех по умолчанию — только /otchet
+    await bot.set_my_commands(
+        commands=[BotCommand(command="otchet", description="отправить отчёт")],
+        scope=BotCommandScopeDefault()
     )
-    await message.answer(text, parse_mode="HTML")
+    # Подстрахуемся: очистим другие глобальные области
+    await bot.set_my_commands([], scope=BotCommandScopeAllPrivateChats())
+    await bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
+    await bot.set_my_commands([], scope=BotCommandScopeAllChatAdministrators())
 
-# ====== ЗАПУСК ======
-if __name__ == "__main__":
+    # 2) Для твоего личного чата — /otchet и /status (видишь только ты)
+    await bot.set_my_commands(
+        commands=[
+            BotCommand(command="otchet", description="отправить отчёт"),
+            BotCommand(command="status", description="проверка статуса отчётов"),
+        ],
+        scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+    )
+
+# ======= Запуск =======
+async def main():
+    await setup_commands()
     print("✅ Бот запущен и слушает Telegram...")
-    dp.run_polling(bot)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())

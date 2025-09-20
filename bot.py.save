@@ -1,4 +1,0 @@
-cd tg-bot
-source venv/bin/activate
-nano bot.py
-
