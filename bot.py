@@ -1,4 +1,4 @@
-# bot.py — без спама, один статус после паузы
+# bot.py — без спама + админ /status для проверки, кто ещё не сдал
 import os
 import re
 import asyncio
@@ -19,6 +19,9 @@ from aiogram.filters import Command
 # ======= ТОКЕНЫ =======
 TELEGRAM_TOKEN = "8306801846:AAEvDQFoiepNmDaxPi5UVDqiNWmz6tUO_KQ"
 YANDEX_TOKEN   = "y0__xCmksrUBxjjojogmLvAsxTMieHo_qAobIbgob8lZd-uDHpoew"
+
+# ====== АДМИН ======
+ADMIN_ID = 445526501  # твой Telegram user_id
 
 # ====== ЛОГИ И БОТ ======
 logging.basicConfig(level=logging.INFO)
@@ -86,6 +89,30 @@ def upload_to_yandex(local_file: str, remote_path: str) -> bool:
     except Exception:
         logging.exception("upload_to_yandex error")
         return False
+
+def yandex_list_dir(path: str) -> List[dict]:
+    """Вернёт список элементов папки (пустой список, если нет папки/ошибка)."""
+    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
+    url = "https://cloud-api.yandex.net/v1/disk/resources"
+    params = {"path": path, "limit": 1000}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("_embedded", {}).get("items", []) or []
+        elif r.status_code == 404:
+            return []
+        else:
+            logging.error("yandex_list_dir %s %s", r.status_code, r.text)
+            return []
+    except Exception:
+        logging.exception("yandex_list_dir error")
+        return []
+
+def yandex_count_files(path: str) -> int:
+    """Считает файлы только в этой папке (без рекурсии)."""
+    items = yandex_list_dir(path)
+    return sum(1 for it in items if it.get("type") == "file")
 
 def get_week_folder(now: Optional[datetime] = None) -> str:
     if now is None:
@@ -162,7 +189,10 @@ def clear_summary_task(session: Dict[str, Any]):
     if task and not task.done():
         task.cancel()
 
-# ====== КОМАНДЫ ======
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+# ====== КОМАНДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ======
 @dp.message(Command("otchet"))
 async def cmd_report(message: Message):
     # новая чистая сессия
@@ -285,6 +315,45 @@ async def on_confirm_upload(cq: CallbackQuery):
     await cq.message.answer(final_text)
 
     user_sessions.pop(user_id, None)
+
+# ====== АДМИН-КОМАНДА /status ======
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    if not is_admin(message.from_user.id):
+        return  # для остальных — тишина, будто команды нет
+
+    week_folder = get_week_folder()
+    week_path = f"{YANDEX_BASE}/{week_folder}"
+
+    def build_missing_report():
+        missing: List[str] = []
+        submitted: List[str] = []
+        for store in STORES:
+            path = f"{week_path}/{store}"
+            cnt = yandex_count_files(path)
+            if cnt > 0:
+                submitted.append(f"{store} — {cnt} файл(ов)")
+            else:
+                missing.append(store)
+        return missing, submitted
+
+    loop = asyncio.get_event_loop()
+    missing, submitted = await loop.run_in_executor(None, build_missing_report)
+
+    total = len(STORES)
+    done = total - len(missing)
+
+    if missing:
+        missing_text = "\n".join(f"• {s}" for s in missing)
+    else:
+        missing_text = "— нет, все сдали 🎉"
+
+    text = (
+        f"<b>Статус отчётов за неделю {week_folder}</b>\n"
+        f"Сдали: <b>{done}</b> из <b>{total}</b>\n\n"
+        f"<b>Ещё не сдали:</b>\n{missing_text}"
+    )
+    await message.answer(text, parse_mode="HTML")
 
 # ====== ЗАПУСК ======
 if __name__ == "__main__":
