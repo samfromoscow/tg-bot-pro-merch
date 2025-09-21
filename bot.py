@@ -1,11 +1,19 @@
-# bot.py — без спама + admin-only /status
+# bot.py — без спама + admin-only /status + ВСЕГДА время по Москве
 import os
 import re
 import asyncio
 import logging
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, Any, List, Tuple, Optional, Set
+
+# ---- Таймзона Москва (поддержка Python 3.8 через backports.zoneinfo)
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:  # Python 3.8
+    from backports.zoneinfo import ZoneInfo
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -60,7 +68,7 @@ YANDEX_BASE = "/Sam/Проект Crown/Фотоотчеты CROWN"
 #             "status_msg": Optional[Tuple[int,int]], "summary_task": Optional[asyncio.Task]}
 user_sessions: Dict[int, Dict[str, Any]] = {}
 
-# На всякий случай память об отправивших за неделю (fallback, если API листинга недоступен)
+# Память об отправивших за неделю (fallback, если листинг API недоступен)
 # submitted_by_week["DD.MM-DD.MM"] = set(store_names)
 submitted_by_week: Dict[str, Set[str]] = {}
 
@@ -97,35 +105,32 @@ def upload_to_yandex(local_file: str, remote_path: str) -> bool:
         return False
 
 def list_folder_children(folder_path: str) -> List[str]:
-    """Вернуть имена вложенных объектов (папок/файлов) в каталоге на Я.Диске.
-    Используется для определения, какие магазины уже создали папку за неделю.
-    """
+    """Имена вложенных папок в каталоге на Я.Диске (для определения, кто уже сдал отчёт)."""
     headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
     url = "https://cloud-api.yandex.net/v1/disk/resources"
-    params = {
-        "path": folder_path,
-        "limit": 1000,
-        "fields": "_embedded.items.name,_embedded.items.type"
-    }
+    params = {"path": folder_path, "limit": 1000, "fields": "_embedded.items.name,_embedded.items.type"}
     try:
         r = requests.get(url, headers=headers, params=params, timeout=30)
         if r.status_code != 200:
             logging.warning("list_folder_children %s -> %s %s", folder_path, r.status_code, r.text)
             return []
-        data = r.json()
-        items = data.get("_embedded", {}).get("items", [])
-        # возвращаем имена только папок
+        items = r.json().get("_embedded", {}).get("items", [])
         return [it.get("name") for it in items if it.get("type") == "dir"]
     except Exception:
         logging.exception("list_folder_children error")
         return []
 
-def get_week_folder(now: Optional[datetime] = None) -> str:
-    if now is None:
-        now = datetime.now()
-    start = now - timedelta(days=now.weekday())
-    end = start + timedelta(days=6)
-    return f"{start.day:02}.{start.month:02}-{end.day:02}.{end.month:02}"
+# ====== ВРЕМЯ ПО МОСКВЕ ======
+def now_msk() -> datetime:
+    return datetime.now(MOSCOW_TZ)
+
+def week_folder_msk(today: Optional[date] = None) -> str:
+    """Имя папки недели вида DD.MM-DD.MM по московской дате (понедельник-воскресенье)."""
+    if today is None:
+        today = now_msk().date()
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+    return f"{monday.day:02}.{monday.month:02}-{sunday.day:02}.{sunday.month:02}"
 
 # ====== КЛАВИАТУРЫ ======
 def build_stores_keyboard() -> InlineKeyboardMarkup:
@@ -236,10 +241,10 @@ async def handle_photo(message: Message):
         await message.answer("Пожалуйста, сначала вызови /otchet и выбери магазин.")
         return
 
-    # сохраняем фото
+    # сохраняем фото (имя файла — московское время)
     photo = message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ts = now_msk().strftime("%Y-%m-%d_%H-%M-%S")
     local_filename = os.path.join(session["tmp_dir"], f"{ts}_{photo.file_id}.jpg")
     await bot.download_file(file_info.file_path, destination=local_filename)
     session["files"].append(local_filename)
@@ -271,7 +276,7 @@ async def on_confirm_upload(cq: CallbackQuery):
 
     store = session["store"]
     files = list(session["files"])
-    week_folder = get_week_folder()
+    week_folder = week_folder_msk()  # <<< неделя по МСК
     base = YANDEX_BASE
     week_path = f"{base}/{week_folder}"
     store_path = f"{week_path}/{store}"
@@ -323,11 +328,10 @@ async def on_confirm_upload(cq: CallbackQuery):
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     if message.from_user.id != ADMIN_ID:
-        # Молча игнорируем или можно ответить:
         await message.answer("Эта команда недоступна.")
         return
 
-    week = get_week_folder()
+    week = week_folder_msk()  # <<< неделя по МСК
     week_path = f"{YANDEX_BASE}/{week}"
 
     # пробуем получить магазины с отчётами из Я.Диска (папки внутри week_path)
@@ -346,7 +350,6 @@ async def cmd_status(message: Message):
     ]
     if missing:
         text_lines.append("\n❌ Не прислали:")
-        # ограничим сообщение, если список длинный
         for s in missing:
             text_lines.append(f"• {s}")
     else:
