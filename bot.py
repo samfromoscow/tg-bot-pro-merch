@@ -1,4 +1,4 @@
-# bot.py — отчёты, неделя по МСК, без спама; админ: /status /addstore /delstore
+# bot.py — отчёты с анти-спам статусом, Москва-тайм, admin /status + /addstore + /delstore (список)
 import os
 import re
 import json
@@ -16,35 +16,48 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     BotCommand,
     BotCommandScopeChat,
-    BotCommandScopeDefault,
 )
 from aiogram.filters import Command
 
-# Py3.8: backports.zoneinfo
-try:
-    from zoneinfo import ZoneInfo  # Py>=3.9
-except Exception:
-    from backports.zoneinfo import ZoneInfo  # Py3.8
-
-# ======= ТОКЕНЫ =======
+# === ТОКЕНЫ (из твоей версии) ===
 TELEGRAM_TOKEN = "8306801846:AAEvDQFoiepNmDaxPi5UVDqiNWmz6tUO_KQ"
 YANDEX_TOKEN   = "y0__xCmksrUBxjjojogmLvAsxTMieHo_qAobIbgob8lZd-uDHpoew"
 
-# ====== АДМИН ======
-ADMIN_ID = 445526501  # только этому пользователю доступны админ-команды
+# === АДМИН ===
+ADMIN_ID = 445526501  # только этому пользователю доступны /status /addstore /delstore и видно их в меню
 
-# ====== ЛОГИ И БОТ ======
+# === ЛОГИ И БОТ ===
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher()
 
-# ====== Константы ======
-SUMMARY_DELAY_SEC = 2.0  # пауза тишины перед показом единственного статуса
-MSK_TZ = ZoneInfo("Europe/Moscow")
+# === КОНСТАНТЫ ===
+SUMMARY_DELAY_SEC = 2.0  # пауза тишины, после которой показываем один статус
+STORES_JSON = "stores.json"  # файл со списком магазинов
+PAGE_SIZE = 9  # по сколько магазинов показывать на страницу при удалении
 
-# ====== Хранилище магазинов ======
-STORES_FILE = "stores.json"
-DEFAULT_STORES: List[str] = [
+# === МОСКОВСКОЕ ВРЕМЯ ===
+try:
+    from zoneinfo import ZoneInfo  # py>=3.9; у нас есть backports в reqs
+except Exception:
+    from backports.zoneinfo import ZoneInfo  # py3.8 fallback
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+# === Сессии пользователей ===
+# user_id -> {"store": str, "files": List[str], "tmp_dir": str,
+#             "status_msg": Optional[Tuple[int,int]], "summary_task": Optional[asyncio.Task]}
+user_sessions: Dict[int, Dict[str, Any]] = {}
+
+# На всякий случай память об отправивших за неделю (fallback)
+# submitted_by_week["DD.MM-DD.MM"] = set(store_names)
+submitted_by_week: Dict[str, Set[str]] = {}
+
+# Небольшой "ожидатель" для админского ввода (добавление магазина)
+admin_wait_add: Dict[int, bool] = {}  # user_id -> True если ждём текст названия нового магазина
+
+
+# === STORES (load/save) ===
+SEED_STORES: List[str] = [
     "ОБИ 013 Белая дача",
     "ОБИ 009 Варшавка",
     "ОБИ 017 Новгород",
@@ -63,50 +76,30 @@ DEFAULT_STORES: List[str] = [
 ]
 
 def load_stores() -> List[str]:
-    if os.path.exists(STORES_FILE):
-        try:
-            with open(STORES_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return list(dict.fromkeys([str(x).strip() for x in data if str(x).strip()]))
-        except Exception:
-            logging.exception("Failed to read stores.json, fallback to default.")
-    # создать файл с дефолтным списком
-    with open(STORES_FILE, "w", encoding="utf-8") as f:
-        json.dump(DEFAULT_STORES, f, ensure_ascii=False, indent=2)
-    logging.info("stores.json created with seed list (%d)", len(DEFAULT_STORES))
-    return DEFAULT_STORES[:]
+    if not os.path.exists(STORES_JSON):
+        with open(STORES_JSON, "w", encoding="utf-8") as f:
+            json.dump(SEED_STORES, f, ensure_ascii=False, indent=2)
+        logging.info("stores.json created with seed list (%d)", len(SEED_STORES))
+        return list(SEED_STORES)
+    try:
+        with open(STORES_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("stores.json corrupted")
+        return [str(x) for x in data]
+    except Exception:
+        logging.exception("Failed to read stores.json, fallback to seed")
+        return list(SEED_STORES)
 
 def save_stores(stores: List[str]) -> None:
-    # уникализируем и сортируем по номеру (если есть)
-    def store_key(s: str) -> Tuple[int, str]:
-        nums = re.findall(r"\d+", s)
-        num = int(nums[-1]) if nums else 10**9
-        return (num, s.lower())
-    clean = [s.strip() for s in stores if s and s.strip()]
-    unique = list(dict.fromkeys(clean))
-    unique_sorted = sorted(unique, key=store_key)
-    with open(STORES_FILE, "w", encoding="utf-8") as f:
-        json.dump(unique_sorted, f, ensure_ascii=False, indent=2)
+    try:
+        with open(STORES_JSON, "w", encoding="utf-8") as f:
+            json.dump(stores, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logging.exception("Failed to save stores.json")
 
-STORES: List[str] = load_stores()
 
-# База папки на Яндекс.Диске
-YANDEX_BASE = "/Sam/Проект Crown/Фотоотчеты CROWN"
-
-# Сессии пользователей
-# user_id -> {"store": str, "files": List[str], "tmp_dir": str,
-#             "status_msg": Optional[Tuple[int,int]], "summary_task": Optional[asyncio.Task]}
-user_sessions: Dict[int, Dict[str, Any]] = {}
-
-# На всякий случай память об отправивших за неделю (если API листинга недоступен)
-# submitted_by_week["DD.MM-DD.MM"] = set(store_names)
-submitted_by_week: Dict[str, Set[str]] = {}
-
-# Простое состояние админа для добавления магазина
-admin_state: Dict[int, str] = {}  # {ADMIN_ID: "await_add_name"}
-
-# ====== УТИЛИТЫ (Yandex) ======
+# === УТИЛИТЫ (Yandex.Disk) ===
 def ensure_folder_exists(folder_path: str) -> bool:
     headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
     url = "https://cloud-api.yandex.net/v1/disk/resources"
@@ -139,6 +132,7 @@ def upload_to_yandex(local_file: str, remote_path: str) -> bool:
         return False
 
 def list_folder_children(folder_path: str) -> List[str]:
+    """Список имён вложенных папок в каталоге на Я.Диске."""
     headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
     url = "https://cloud-api.yandex.net/v1/disk/resources"
     params = {
@@ -158,25 +152,27 @@ def list_folder_children(folder_path: str) -> List[str]:
         logging.exception("list_folder_children error")
         return []
 
-def now_msk() -> datetime:
-    return datetime.now(MSK_TZ)
+# База папки на Яндекс.Диске
+YANDEX_BASE = "/Sam/Проект Crown/Фотоотчеты CROWN"
 
 def get_week_folder(now: Optional[datetime] = None) -> str:
+    """Неделя по Москве: Пн–Вс в формате 'DD.MM-DD.MM'."""
     if now is None:
-        now = now_msk()
-    start = (now - timedelta(days=now.weekday())).date()
-    end = (start + timedelta(days=6))
+        now = datetime.now(MOSCOW_TZ)
+    # понедельник текущей недели
+    start = (now - timedelta(days=now.weekday()))
+    end = start + timedelta(days=6)
     return f"{start.day:02}.{start.month:02}-{end.day:02}.{end.month:02}"
 
-# ====== КЛАВИАТУРЫ ======
+
+# === КЛАВИАТУРЫ ===
+def _store_sort_key(s: str) -> int:
+    nums = re.findall(r"\d+", s)
+    return int(nums[-1]) if nums else 0
+
 def build_stores_keyboard() -> InlineKeyboardMarkup:
-    def store_key(s: str) -> int:
-        nums = re.findall(r"\d+", s)
-        return int(nums[-1]) if nums else 0
-    sorted_stores = sorted(STORES, key=store_key)
-    buttons = [InlineKeyboardButton(text=s, callback_data=f"store:{i}") for i, s in enumerate(sorted_stores)]
-    # сохраним сопоставление индексов к текущему отсортированному списку
-    # (для простоты — пересчитаем из STORES в обработчике)
+    stores = sorted(load_stores(), key=_store_sort_key)
+    buttons = [InlineKeyboardButton(text=s, callback_data=f"store:{s}") for s in stores]
     rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
     rows.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -185,31 +181,53 @@ def build_send_keyboard() -> InlineKeyboardMarkup:
     btn = InlineKeyboardButton(text="📤 Отправить отчёт", callback_data="confirm_upload")
     return InlineKeyboardMarkup(inline_keyboard=[[btn]])
 
-def build_delete_list_keyboard() -> InlineKeyboardMarkup:
-    # Кнопки для удаления магазинов (по индексам текущего STORES, отсортированных как в выборе)
-    def store_key(s: str) -> int:
-        nums = re.findall(r"\d+", s)
-        return int(nums[-1]) if nums else 0
-    sorted_idx = sorted(range(len(STORES)), key=lambda k: store_key(STORES[k]))
-    buttons = [
-        InlineKeyboardButton(text=STORES[i], callback_data=f"askdel:{i}")
-        for i in sorted_idx
-    ]
-    rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
-    rows.append([InlineKeyboardButton(text="Закрыть", callback_data="del_cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def build_delstore_page(page: int = 0) -> InlineKeyboardMarkup:
+    stores = sorted(load_stores(), key=_store_sort_key)
+    total = len(stores)
+    if total == 0:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Закрыть", callback_data="del_close")]
+        ])
 
-def build_confirm_delete_keyboard(idx: int) -> InlineKeyboardMarkup:
+    pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    start = page * PAGE_SIZE
+    chunk = stores[start:start + PAGE_SIZE]
+
+    kb_rows: List[List[InlineKeyboardButton]] = []
+    for name in chunk:
+        kb_rows.append([
+            InlineKeyboardButton(text=name, callback_data=f"delstore:{name}")
+        ])
+
+    nav_row: List[InlineKeyboardButton] = []
+    if pages > 1:
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"delpage:{page-1}"))
+        nav_row.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="noop"))
+        if page < pages - 1:
+            nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"delpage:{page+1}"))
+    if nav_row:
+        kb_rows.append(nav_row)
+
+    kb_rows.append([InlineKeyboardButton(text="Отмена", callback_data="del_close")])
+    return InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+def build_del_confirm(name: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delok:{idx}")],
-        [InlineKeyboardButton(text="↩️ Назад к списку", callback_data="del_back")]
+        [InlineKeyboardButton(text="✅ Удалить", callback_data=f"delconfirm:yes:{name}")],
+        [InlineKeyboardButton(text="❌ Отмена",  callback_data=f"delconfirm:no:{name}")],
     ])
 
-# ====== ХЭЛПЕРЫ (статус) ======
+
+# === ХЭЛПЕРЫ (анти-спам статус) ===
 async def schedule_summary_message(message: Message, user_id: int):
+    """Планирует показ ОДНОГО статус-сообщения после паузы SUMMARY_DELAY_SEC."""
     session = user_sessions.get(user_id)
     if not session:
         return
+
+    # отменяем предыдущий таймер, если есть
     task: Optional[asyncio.Task] = session.get("summary_task")
     if task and not task.done():
         task.cancel()
@@ -250,34 +268,19 @@ def clear_summary_task(session: Dict[str, Any]):
     if task and not task.done():
         task.cancel()
 
-# ====== КОМАНДЫ ДЛЯ ВСЕХ ======
+
+# === КОМАНДЫ ДЛЯ СОТРУДНИКОВ ===
 @dp.message(Command("otchet"))
 async def cmd_report(message: Message):
     # новая чистая сессия
     user_sessions.pop(message.from_user.id, None)
     await message.answer("Выберите магазин (нажми кнопку):", reply_markup=build_stores_keyboard())
 
-# ====== ВЫБОР МАГАЗИНА ======
 @dp.callback_query(lambda c: c.data and c.data.startswith("store:"))
 async def process_store_choice(cq: CallbackQuery):
     await cq.answer()
     user_id = cq.from_user.id
-    # индекс магазина из отсортированного списка
-    try:
-        idx_in_sorted = int(cq.data.split(":", 1)[1])
-    except Exception:
-        await cq.message.answer("Не удалось определить магазин. Попробуйте /otchet ещё раз.")
-        return
-
-    # пересоберём такой же отсортированный список
-    def store_key(s: str) -> int:
-        nums = re.findall(r"\d+", s)
-        return int(nums[-1]) if nums else 0
-    sorted_stores = sorted(STORES, key=store_key)
-    if idx_in_sorted < 0 or idx_in_sorted >= len(sorted_stores):
-        await cq.message.answer("Магазин не найден. Попробуйте /otchet снова.")
-        return
-    store = sorted_stores[idx_in_sorted]
+    store = cq.data.split(":", 1)[1]
 
     tmp_dir = os.path.join("tmp_reports", str(user_id))
     os.makedirs(tmp_dir, exist_ok=True)
@@ -290,9 +293,7 @@ async def process_store_choice(cq: CallbackQuery):
         "summary_task": None,      # asyncio.Task
     }
 
-    await cq.message.answer(
-        "Теперь отправьте фото.\nПосле всех фото нажмите кнопку «📤 Отправить отчёт»."
-    )
+    await cq.message.answer("Теперь отправьте фото.\nПосле всех фото нажмите кнопку «📤 Отправить отчёт».")
 
 @dp.callback_query(lambda c: c.data == "cancel")
 async def on_cancel(cq: CallbackQuery):
@@ -302,7 +303,6 @@ async def on_cancel(cq: CallbackQuery):
         clear_summary_task(sess)
     await cq.message.answer("Отменено. Начни заново: /otchet")
 
-# ====== ПРИЁМ ФОТО (без спама) ======
 @dp.message(F.photo)
 async def handle_photo(message: Message):
     user_id = message.from_user.id
@@ -311,18 +311,17 @@ async def handle_photo(message: Message):
         await message.answer("Пожалуйста, сначала вызови /otchet и выбери магазин.")
         return
 
-    # сохраняем фото
+    # сохраняем фото локально
     photo = message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
-    ts = now_msk().strftime("%Y-%m-%d_%H-%M-%S")
+    ts = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d_%H-%M-%S")
     local_filename = os.path.join(session["tmp_dir"], f"{ts}_{photo.file_id}.jpg")
     await bot.download_file(file_info.file_path, destination=local_filename)
     session["files"].append(local_filename)
 
-    # планируем единый статус
+    # планируем ОДИН статус после паузы
     await schedule_summary_message(message, user_id)
 
-# ====== ЗАГРУЗКА НА ДИСК ======
 @dp.callback_query(lambda c: c.data == "confirm_upload")
 async def on_confirm_upload(cq: CallbackQuery):
     await cq.answer()
@@ -332,6 +331,7 @@ async def on_confirm_upload(cq: CallbackQuery):
         await cq.message.answer("Нет фото для загрузки. Отправьте фото или вызовите /otchet.")
         return
 
+    # убираем статус и таймер
     clear_summary_task(session)
     if session.get("status_msg"):
         chat_id, msg_id = session["status_msg"]
@@ -363,7 +363,7 @@ async def on_confirm_upload(cq: CallbackQuery):
                     os.remove(local_file)
                 except Exception:
                     pass
-        # удалить пустую временную папку
+        # удалить пустую временную папку (если опустела)
         try:
             tmpdir = session.get("tmp_dir")
             if tmpdir and os.path.isdir(tmpdir) and not os.listdir(tmpdir):
@@ -372,9 +372,10 @@ async def on_confirm_upload(cq: CallbackQuery):
             pass
         return uploaded, len(files)
 
-    loop = asyncio.get_event_loop()  # Py3.8 совместимо
+    loop = asyncio.get_event_loop()  # совместимо с Python 3.8
     uploaded, total = await loop.run_in_executor(None, do_upload)
 
+    # пометим, что у этого магазина есть отчёт на этой неделе
     if uploaded > 0:
         submitted_by_week.setdefault(week_folder, set()).add(store)
 
@@ -392,7 +393,8 @@ async def on_confirm_upload(cq: CallbackQuery):
 
     user_sessions.pop(user_id, None)
 
-# ====== АДМИН /status ======
+
+# === АДМИН: /status ===
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -401,14 +403,20 @@ async def cmd_status(message: Message):
 
     week = get_week_folder()
     week_path = f"{YANDEX_BASE}/{week}"
-    existing_dirs = set(list_folder_children(week_path)) or submitted_by_week.get(week, set())
 
-    total = len(STORES)
-    done = sorted([s for s in STORES if s in existing_dirs])
-    missing = sorted([s for s in STORES if s not in existing_dirs])
+    # магазины с отчётами из Я.Диска (папки внутри week_path)
+    existing_dirs = set(list_folder_children(week_path))
+    if not existing_dirs:
+        # fallback к памяти если API недоступен/пусто
+        existing_dirs = submitted_by_week.get(week, set())
+
+    stores = load_stores()
+    total = len(stores)
+    done = sorted([s for s in stores if s in existing_dirs], key=_store_sort_key)
+    missing = sorted([s for s in stores if s not in existing_dirs], key=_store_sort_key)
 
     text_lines = [
-        f"📆 Неделя: {week} (МСК)",
+        f"📆 Неделя: {week}",
         f"✅ Отчёты получены: {len(done)} / {total}",
     ]
     if missing:
@@ -420,130 +428,122 @@ async def cmd_status(message: Message):
 
     await message.answer("\n".join(text_lines))
 
-# ====== АДМИН /addstore (интерактивно) ======
+
+# === АДМИН: /addstore (ввод вручную) ===
 @dp.message(Command("addstore"))
 async def cmd_addstore(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    admin_state[ADMIN_ID] = "await_add_name"
-    await message.answer(
-        "Отправьте точное название нового магазина одним сообщением.\n"
-        "Например: «ОБИ 034 Саратов».\n"
-        "Чтобы отменить — отправьте /cancel."
-    )
-
-@dp.message(Command("cancel"))
-async def cmd_cancel_admin(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    # если админ сразу написал название: /addstore ОБИ 034 Саратов
+    parts = message.text.split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip():
+        name = parts[1].strip()
+        stores = load_stores()
+        if name in stores:
+            await message.answer("Такой магазин уже есть.")
+            return
+        stores.append(name)
+        save_stores(stores)
+        await message.answer(f"✅ Добавлен: {name}")
         return
-    if admin_state.get(ADMIN_ID) == "await_add_name":
-        admin_state.pop(ADMIN_ID, None)
-        await message.answer("Добавление магазина отменено.")
-    else:
-        await message.answer("Нечего отменять.")
+
+    # иначе попросим прислать название отдельным сообщением
+    admin_wait_add[message.from_user.id] = True
+    await message.answer("Пришлите название магазина одной строкой.\nНапример: «ОБИ 034 Саратов»")
 
 @dp.message(F.text)
-async def handle_admin_add_name(message: Message):
-    # перехватываем только когда админ в режиме добавления
+async def on_admin_add_name(message: Message):
+    # ловим текст только если ждём от админа /addstore
     if message.from_user.id != ADMIN_ID:
         return
-    if admin_state.get(ADMIN_ID) != "await_add_name":
+    if not admin_wait_add.get(message.from_user.id):
         return
-
     name = message.text.strip()
     if not name:
-        await message.answer("Пустое название. Введите ещё раз или /cancel.")
+        await message.answer("Название пустое. Пришлите корректное название.")
         return
-    if name in STORES:
-        await message.answer("Такой магазин уже есть в списке.")
-        admin_state.pop(ADMIN_ID, None)
-        return
+    stores = load_stores()
+    if name in stores:
+        await message.answer("Такой магазин уже есть.")
+    else:
+        stores.append(name)
+        save_stores(stores)
+        await message.answer(f"✅ Добавлен: {name}")
+    admin_wait_add.pop(message.from_user.id, None)
 
-    STORES.append(name)
-    save_stores(STORES)
-    admin_state.pop(ADMIN_ID, None)
-    await message.answer(f"✅ Магазин добавлен: {name}")
 
-# ====== АДМИН /delstore (списком) ======
+# === АДМИН: /delstore (список с выбором и подтверждением) ===
 @dp.message(Command("delstore"))
 async def cmd_delstore(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    if not STORES:
-        await message.answer("Список магазинов пуст.")
-        return
-    await message.answer("Выберите магазин для удаления:", reply_markup=build_delete_list_keyboard())
+    kb = build_delstore_page(page=0)
+    await message.answer("Выберите магазин для удаления:", reply_markup=kb)
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("askdel:"))
-async def cb_ask_delete(cq: CallbackQuery):
+@dp.callback_query(F.data.startswith("delpage:"))
+async def on_del_page(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID:
-        await cq.answer("Недоступно.")
+        await cq.answer()
         return
     try:
-        idx = int(cq.data.split(":", 1)[1])
+        page = int(cq.data.split(":", 1)[1])
     except Exception:
-        await cq.answer("Ошибка индекса.")
-        return
-    if idx < 0 or idx >= len(STORES):
-        await cq.answer("Магазин не найден.")
-        return
-    name = STORES[idx]
-    await cq.message.edit_text(
-        f"Удалить магазин?\n\n🗑 {name}",
-        reply_markup=build_confirm_delete_keyboard(idx)
-    )
+        page = 0
+    await cq.message.edit_reply_markup(reply_markup=build_delstore_page(page))
+    await cq.answer()
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("delok:"))
-async def cb_delete_ok(cq: CallbackQuery):
+@dp.callback_query(F.data.startswith("delstore:"))
+async def on_del_select(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID:
-        await cq.answer("Недоступно.")
+        await cq.answer()
+        return
+    name = cq.data.split(":", 1)[1]
+    await cq.message.edit_text(f"Удалить магазин?\n\n{name}", reply_markup=build_del_confirm(name))
+    await cq.answer()
+
+@dp.callback_query(F.data.startswith("delconfirm:"))
+async def on_del_confirm(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID:
+        await cq.answer()
+        return
+    _, answer, name = cq.data.split(":", 2)
+    if answer == "yes":
+        stores = load_stores()
+        if name in stores:
+            stores = [s for s in stores if s != name]
+            save_stores(stores)
+            await cq.message.edit_text(f"✅ Удалён: {name}")
+        else:
+            await cq.message.edit_text("Не найден (возможно уже удалён).")
+    else:
+        await cq.message.edit_text("Отменено.")
+    await cq.answer()
+
+@dp.callback_query(lambda c: c.data == "del_close")
+async def on_del_close(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID:
+        await cq.answer()
         return
     try:
-        idx = int(cq.data.split(":", 1)[1])
+        await cq.message.delete()
     except Exception:
-        await cq.answer("Ошибка индекса.")
-        return
-    if idx < 0 or idx >= len(STORES):
-        await cq.answer("Магазин не найден.")
-        return
-    name = STORES[idx]
-    # удаляем
-    del STORES[idx]
-    save_stores(STORES)
-    await cq.message.edit_text(f"✅ Удалено: {name}")
+        pass
+    await cq.answer()
 
-@dp.callback_query(lambda c: c.data == "del_back")
-async def cb_delete_back(cq: CallbackQuery):
-    if cq.from_user.id != ADMIN_ID:
-        await cq.answer("Недоступно.")
-        return
-    await cq.message.edit_text("Выберите магазин для удаления:", reply_markup=build_delete_list_keyboard())
+@dp.callback_query(F.data == "noop")
+async def on_noop(cq: CallbackQuery):
+    await cq.answer(cache_time=1)
 
-@dp.callback_query(lambda c: c.data == "del_cancel")
-async def cb_delete_cancel(cq: CallbackQuery):
-    if cq.from_user.id != ADMIN_ID:
-        await cq.answer("Недоступно.")
-        return
-    await cq.message.edit_text("Закрыто.")
 
-# ====== on_startup: меню ======
+# === on_startup: админ-меню только для ADMIN_ID ===
 async def on_startup(bot: Bot):
-    # меню по умолчанию (для всех): только /otchet
-    try:
-        await bot.set_my_commands(
-            commands=[BotCommand(command="otchet", description="Начать отчёт")],
-            scope=BotCommandScopeDefault(),
-        )
-    except Exception as e:
-        logging.warning("Can't set default menu: %s", e)
-    # меню админа
     try:
         await bot.set_my_commands(
             commands=[
-                BotCommand(command="otchet",    description="Начать отчёт"),
-                BotCommand(command="status",    description="Статус отчётов"),
-                BotCommand(command="addstore",  description="Добавить магазин"),
-                BotCommand(command="delstore",  description="Удалить магазин"),
+                BotCommand(command="otchet",   description="Начать отчёт"),
+                BotCommand(command="status",   description="Статус отчётов"),
+                BotCommand(command="addstore", description="Добавить магазин"),
+                BotCommand(command="delstore", description="Удалить магазин"),
             ],
             scope=BotCommandScopeChat(chat_id=ADMIN_ID),
         )
@@ -552,7 +552,8 @@ async def on_startup(bot: Bot):
 
 dp.startup.register(on_startup)
 
-# ====== ЗАПУСК ======
+
+# === ЗАПУСК ===
 if __name__ == "__main__":
     print("✅ Бот запущен и слушает Telegram...")
     dp.run_polling(bot)
