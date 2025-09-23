@@ -250,7 +250,6 @@ def rows_of(buttons: List[InlineKeyboardButton], cols: int) -> List[List[InlineK
 
 def build_projects_kb(for_admin: bool=False) -> InlineKeyboardMarkup:
     names = list_projects()
-    btns = [[InlineKeyboardButton(text=proj, callback_data=f"proj:{proj}") ] for proj in projects]
     # сортировка и сборка
     buttons = [InlineKeyboardButton(text=p, callback_data=f"proj:{p}") for p in names]
     rows = rows_of(buttons, cols=2)
