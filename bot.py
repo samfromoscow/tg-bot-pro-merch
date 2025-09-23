@@ -1,673 +1,809 @@
 # bot.py
-import asyncio
+# -*- coding: utf-8 -*-
+
+import os
 import json
 import logging
-import os
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command
 from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    FSInputFile,
 )
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ================== НАСТРОЙКИ ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Рекомендуется хранить токен в окружении
-if not BOT_TOKEN:
-    # fallback — можешь подставить свой токен, но лучше один раз выставить переменную окружения
-    BOT_TOKEN = "PUT_YOUR_TOKEN_HERE"
-
-ADMIN_IDS = {445526501}  # Sam
-
-DATA_DIR = Path(__file__).parent
-PROJECTS_FILE = DATA_DIR / "projects.json"
-SUBMITS_FILE = DATA_DIR / "submits.json"
-
-CROWN = "CROWN"
-PIT = "PIT"
-GREENWORKS = "GREENWORKS"
-
-# ================== ЛОГИ ==================
+# ============ НАСТРОЙКИ ЛОГГЕРА ============
 logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s:%(name)s:%(message)s"
 )
 log = logging.getLogger("bot")
 
-# ================== ХЕЛПЕРЫ ДАТ ==================
-def week_label_msk() -> str:
-    """Строка недели вида 'dd.mm-dd.mm' по МСК."""
-    now = datetime.now(timezone(timedelta(hours=3)))
-    start = now - timedelta(days=now.weekday())  # понедельник
-    end = start + timedelta(days=6)              # воскресенье
+# ============ ТОКЕН ============
+# Твой токен из переписки, чтобы всё завелось без доп. правок.
+BOT_TOKEN = "8306801846:AAEvDQFoiepNmDaxPi5UVDqiNWmz6tUO_KQ"
+
+# Если захочешь — можно переключить на переменную окружения:
+# BOT_TOKEN = (
+#     os.getenv("BOT_TOKEN")
+#     or os.getenv("TELEGRAM_TOKEN")
+#     or os.getenv("TG_TOKEN")
+#     or "PASTE_YOUR_TOKEN_HERE"
+# )
+
+# ============ ФАЙЛЫ ДАННЫХ ============
+PROJECTS_FILE = os.path.join(os.path.dirname(__file__), "projects.json")
+SUBMIT_FILE   = os.path.join(os.path.dirname(__file__), "submissions.json")
+
+# ============ КОНСТАНТЫ ============
+MSK_TZ = timezone(timedelta(hours=3))
+
+ADMINS: List[int] = [
+    # Твой id уже был в логах.
+    445526501,
+]
+
+# Для статуса считаем «неделю» как ПН–ВС по МСК
+def current_week_label() -> str:
+    now = datetime.now(MSK_TZ)
+    start = now - timedelta(days=now.weekday())
+    end = start + timedelta(days=6)
     return f"{start.day:02}.{start.month:02}-{end.day:02}.{end.month:02}"
 
-def week_key() -> str:
-    now = datetime.now(timezone(timedelta(hours=3)))
-    iso_year, iso_week, _ = now.isocalendar()
-    return f"{iso_year}-W{iso_week:02d}:{week_label_msk()}"
+# ============ ФСМ СОСТОЯНИЯ ============
+class Report(StatesGroup):
+    waiting_project = State()
+    waiting_client  = State()
+    waiting_store   = State()
+    waiting_photos  = State()
 
-# ================== РАБОТА С ДИСКОМ ==================
-def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
+class AdminAdd(StatesGroup):
+    waiting_project = State()
+    waiting_client  = State()
+    waiting_name    = State()
+    confirm         = State()
+
+class AdminDelStore(StatesGroup):
+    waiting_project = State()
+    waiting_store   = State()
+
+class AdminDelProject(StatesGroup):
+    confirm = State()
+
+class StatusFlow(StatesGroup):
+    waiting_project = State()
+    waiting_client  = State()
+
+# ============ УТИЛИТЫ ХРАНИЛИЩА ============
+def load_json(path: str, default):
+    if not os.path.exists(path):
         return default
     try:
-        with path.open("r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
 
-def save_json(path: Path, data: Any) -> None:
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
+def save_json(path: str, data) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    tmp.replace(path)
+    os.replace(tmp, path)
 
-def ensure_files():
-    # projects.json — создаём только при отсутствии
-    if not PROJECTS_FILE.exists():
-        seed = {
-            PIT: {
-                "title": "PIT",
-                "base": "/Sam/Проект PIT/Фотоотчеты PIT",
-                "clients": [],
-                "stores": [
-                    {"name": "ОБИ 013 Белая дача", "client": None},
-                    {"name": "ОБИ 042 Брянск", "client": None},
-                    {"name": "ОБИ 006 Боровка", "client": None},
-                    {"name": "ОБИ 037 Авиапарк", "client": None},
-                    {"name": "ОБИ 039 Новая Рига", "client": None},  # <— исправлено
-                    {"name": "ОБИ 001 Теплый стан", "client": None},
-                ],
+def ensure_seed():
+    projects = load_json(PROJECTS_FILE, default=None)
+    if projects is not None:
+        return  # уже есть
+
+    # Базы из окружения (если заданы) — не обязательно
+    pit_base = os.getenv("PIT_BASE", "/Sam/Проект PIT/Фотоотчеты PIT")
+    green_m_base = os.getenv("GREENWORKS_BASE_M", "/Sam/Проект Seasons/Фотоотчеты Greenworks seasons/Михаил")
+    green_a_base = os.getenv("GREENWORKS_BASE_A", "/Sam/Проект Seasons/Фотоотчеты Greenworks seasons/Александр")
+    crown_base = os.getenv("CROWN_BASE", "/Sam/Проект Crown/Фотоотчеты Crown")
+
+    # Твои магазины PIT (с фиксами «Новая Рига»)
+    pit_stores = [
+        "ОБИ 013 Белая дача",
+        "ОБИ 042 Брянск",
+        "ОБИ 006 Боровка",
+        "ОБИ 037 Авиапарк",
+        "ОБИ 039 Новая Рига",
+        "ОБИ 001 Теплый стан",
+    ]
+
+    # GREENWORKS Михаил
+    gw_m = [
+        "Бау Центр Дзержинка Калининград",
+        "Бау Центр Московский Калининград",
+        "Бау Центр Новороссийск",
+        "Бау Центр Пушкино",
+        "Дарвин Зеленоград",
+        "Дарвин Подольск",
+        "Дарвин Пушкино",
+        "Колорлон Новосибирск",
+        "Колорлон, Бредск",
+        "Петрович Дмитровка",
+        "Петрович Санкт-Петербург",
+    ]
+
+    # GREENWORKS Александр
+    gw_a = [
+        "Вектор Пенза",
+        "Дачник Демская",
+        "Дачник Романтиков",
+        "Моя Родня Окружная",
+        "Моя Родня Рахманинова",
+        "Моя Родня Терновского",
+        "Сарай (Ульяновск)",
+        "Строй-С Гвардейская",
+        "Строй-С Усть-Курдюмская",
+        "Юрат Чебоксары",
+    ]
+
+    projects_seed = {
+        "CROWN": {
+            "type": "simple",
+            "base": crown_base,
+            "stores": []  # ты магазины уже добивал вручную — оставляю пусто
+        },
+        "PIT": {
+            "type": "simple",
+            "base": pit_base,
+            "stores": pit_stores
+        },
+        "GREENWORKS": {
+            "type": "multi",
+            "clients": ["Михаил", "Александр"],
+            "bases": {
+                "Михаил": green_m_base,
+                "Александр": green_a_base
             },
-            GREENWORKS: {
-                "title": "GREENWORKS",
-                "base": "/Sam/Проект Seasons/Фотоотчеты Greenworks seasons",
-                "clients": ["Михаил", "Александр"],
-                "stores": [
-                    # Михаил
-                    {"name": "Бау Центр Дзержинка Калининград", "client": "Михаил"},
-                    {"name": "Бау Центр Московский Калининград", "client": "Михаил"},
-                    {"name": "Бау Центр Новороссийск", "client": "Михаил"},
-                    {"name": "Бау Центр Пушкино", "client": "Михаил"},
-                    {"name": "Дарвин Зеленоград", "client": "Михаил"},
-                    {"name": "Дарвин Подольск", "client": "Михаил"},
-                    {"name": "Дарвин Пушкино", "client": "Михаил"},
-                    {"name": "Колорлон Новосибирск", "client": "Михаил"},
-                    {"name": "Колорлон, Бредск", "client": "Михаил"},
-                    {"name": "Петрович Дмитровка", "client": "Михаил"},
-                    {"name": "Петрович Санкт-Петербург", "client": "Михаил"},
-                    # Александр
-                    {"name": "Вектор Пенза", "client": "Александр"},
-                    {"name": "Дачник Демская", "client": "Александр"},
-                    {"name": "Дачник Романтиков", "client": "Александр"},
-                    {"name": "Моя Родня Окружная", "client": "Александр"},
-                    {"name": "Моя Родня Рахманинова", "client": "Александр"},
-                    {"name": "Моя Родня Терновского", "client": "Александр"},
-                    {"name": "Сарай (Ульяновск)", "client": "Александр"},
-                    {"name": "Строй-С Гвардейская", "client": "Александр"},
-                    {"name": "Строй-С Усть-Курдюмская", "client": "Александр"},
-                    {"name": "Юрат Чебоксары", "client": "Александр"},
-                ],
-            },
-            CROWN: {
-                "title": "CROWN",
-                "base": "/Sam/Проект CROWN/Фотоотчеты CROWN",
-                "clients": [],
-                "stores": [],  # не трогаем — добавляешь сам в бою
-            },
+            "stores": {
+                "Михаил": gw_m,
+                "Александр": gw_a
+            }
         }
-        save_json(PROJECTS_FILE, seed)
-        log.info("projects.json created with seed")
-    # submits.json
-    if not SUBMITS_FILE.exists():
-        save_json(SUBMITS_FILE, {})
-        log.info("submits.json created")
+    }
+    save_json(PROJECTS_FILE, projects_seed)
+    log.info("projects.json created with seed")
 
-def load_projects() -> Dict[str, Any]:
-    return load_json(PROJECTS_FILE, {})
+def load_projects() -> dict:
+    return load_json(PROJECTS_FILE, default={})
 
-def save_projects(data: Dict[str, Any]) -> None:
-    save_json(PROJECTS_FILE, data)
+def save_projects(p: dict) -> None:
+    save_json(PROJECTS_FILE, p)
+
+def load_submissions() -> dict:
+    return load_json(SUBMIT_FILE, default={})
+
+def save_submissions(s: dict) -> None:
+    save_json(SUBMIT_FILE, s)
 
 def list_projects() -> List[str]:
-    data = load_projects()
-    # Порядок: CROWN, PIT, GREENWORKS если есть
-    order = [CROWN, PIT, GREENWORKS]
-    names = [p for p in order if p in data] + [k for k in data.keys() if k not in order]
-    return names
+    p = load_projects()
+    return sorted(p.keys())
 
-def get_clients(slug: str) -> List[str]:
-    data = load_projects()
-    item = data.get(slug, {})
-    return item.get("clients", []) or []
+def is_multi(project: str) -> bool:
+    p = load_projects()
+    data = p.get(project, {})
+    return data.get("type") == "multi"
 
-def get_stores(slug: str, client: Optional[str] = None) -> List[Dict[str, Any]]:
-    data = load_projects()
-    stores = data.get(slug, {}).get("stores", [])
-    if client:
-        stores = [s for s in stores if s.get("client") == client]
-    return stores
+def get_clients(project: str) -> List[str]:
+    p = load_projects()
+    data = p.get(project, {})
+    if data.get("type") == "multi":
+        return data.get("clients", [])
+    return ["*"]
 
-def add_store(slug: str, name: str, client: Optional[str]) -> None:
-    data = load_projects()
-    proj = data.setdefault(slug, {"title": slug, "base": "", "clients": [], "stores": []})
-    # если клиент для GREENWORKS, но не добавлен в список — добавим
-    if client and client not in proj.get("clients", []):
-        proj.setdefault("clients", []).append(client)
-    proj.setdefault("stores", []).append({"name": name, "client": client})
-    save_projects(data)
+def get_stores(project: str, client: Optional[str] = None) -> List[str]:
+    p = load_projects()
+    data = p.get(project, {})
+    if data.get("type") == "multi":
+        if not client:
+            return []  # для multi без клиента — ничего
+        return data.get("stores", {}).get(client, [])
+    # simple
+    return data.get("stores", [])
 
-def del_store(slug: str, index: int) -> Optional[str]:
-    data = load_projects()
-    stores = data.get(slug, {}).get("stores", [])
-    if 0 <= index < len(stores):
-        name = stores[index]["name"]
-        del stores[index]
-        save_projects(data)
-        return name
-    return None
+def get_base_path(project: str, client: Optional[str] = None) -> str:
+    p = load_projects()
+    data = p.get(project, {})
+    if data.get("type") == "multi":
+        if not client:
+            return ""
+        bases = data.get("bases", {})
+        return bases.get(client, "")
+    return data.get("base", "")
 
-def del_project(slug: str) -> bool:
-    data = load_projects()
-    if slug in data:
-        del data[slug]
-        save_projects(data)
-        return True
-    return False
+def add_store(project: str, name: str, client: Optional[str] = None) -> bool:
+    if name.strip().upper() in ("DELETE", "/DELETE", "DEL", "/DEL"):
+        return False  # не позволяем назвать магазин как команду
+    p = load_projects()
+    if project not in p:
+        return False
+    data = p[project]
+    if data.get("type") == "multi":
+        if not client:
+            return False
+        stores = data.setdefault("stores", {}).setdefault(client, [])
+        if name not in stores:
+            stores.append(name)
+    else:
+        stores = data.setdefault("stores", [])
+        if name not in stores:
+            stores.append(name)
+    save_projects(p)
+    return True
 
-def mark_submitted(slug: str, store_name: str):
-    db = load_json(SUBMITS_FILE, {})
-    key = week_key()
-    proj = db.setdefault(key, {}).setdefault(slug, {})
-    proj[store_name] = True
-    save_json(SUBMITS_FILE, db)
+def del_store(project: str, store: str) -> bool:
+    p = load_projects()
+    if project not in p:
+        return False
+    data = p[project]
+    changed = False
+    if data.get("type") == "multi":
+        for c in data.get("clients", []):
+            lst = data.get("stores", {}).get(c, [])
+            if store in lst:
+                lst.remove(store)
+                changed = True
+    else:
+        lst = data.get("stores", [])
+        if store in lst:
+            lst.remove(store)
+            changed = True
+    if changed:
+        save_projects(p)
+    return changed
 
-def get_submitted(slug: str) -> Dict[str, bool]:
-    db = load_json(SUBMITS_FILE, {})
-    key = week_key()
-    return db.get(key, {}).get(slug, {})
+def del_project(project: str) -> bool:
+    p = load_projects()
+    if project not in p:
+        return False
+    p.pop(project)
+    save_projects(p)
+    # очищаем отправки по проекту
+    s = load_submissions()
+    week = current_week_label()
+    if week in s and project in s[week]:
+        s[week].pop(project, None)
+        save_submissions(s)
+    return True
 
-# ================== КЛАВИАТУРЫ ==================
+def mark_submitted(project: str, store: str, client: Optional[str]) -> None:
+    s = load_submissions()
+    week = current_week_label()
+    s.setdefault(week, {}).setdefault(project, {})
+    key = store if not client else f"{client}::{store}"
+    s[week][project][key] = True
+    save_submissions(s)
+
+def get_week_status(project: str, client: Optional[str]) -> Tuple[List[str], List[str]]:
+    """
+    Возвращает (сдали, не сдали) по текущей неделе.
+    Для GREENWORKS:
+      - если client=None => учитываем оба клиента
+      - если client задан => только его магазины
+    """
+    s = load_submissions()
+    p = load_projects()
+    week = current_week_label()
+
+    submitted: set = set()
+    if week in s and project in s[week]:
+        submitted = set(k for k, v in s[week][project].items() if v)
+
+    all_stores: List[Tuple[Optional[str], str]] = []
+    data = p.get(project, {})
+    if data.get("type") == "multi":
+        clients = data.get("clients", [])
+        for c in clients:
+            if (client is None) or (client == c):
+                for st in data.get("stores", {}).get(c, []):
+                    all_stores.append((c, st))
+    else:
+        for st in data.get("stores", []):
+            all_stores.append((None, st))
+
+    done, not_done = [], []
+    for c, st in all_stores:
+        key = st if not c else f"{c}::{st}"
+        label = st if not c else f"{st} ({c})"
+        if key in submitted:
+            done.append(label)
+        else:
+            not_done.append(label)
+    return (sorted(done), sorted(not_done))
+
+# ============ КЛАВИАТУРЫ ============
 def rows_of(buttons: List[InlineKeyboardButton], cols: int) -> List[List[InlineKeyboardButton]]:
     if cols <= 1:
         return [[b] for b in buttons]
-    return [buttons[i:i + cols] for i in range(0, len(buttons), cols)]
+    return [buttons[i:i+cols] for i in range(0, len(buttons), cols)]
 
-def kb_projects(ns: str, admin: bool = False) -> InlineKeyboardMarkup:
-    """ns задаёт пространство имён для коллбэков:
-       report / admadd / admdel / admstatus / admdelproj
-    """
+def kb_projects(for_admin: bool = False) -> InlineKeyboardMarkup:
     names = list_projects()
-    buttons = [InlineKeyboardButton(text=p, callback_data=f"{ns}:proj:{p}") for p in names]
+    buttons = [InlineKeyboardButton(text=p, callback_data=f"proj:{p}") for p in names]
     rows = rows_of(buttons, cols=2)
-    # нижний ряд
-    if admin:
-        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{ns}:cancel")])
-    else:
-        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="report:cancel")])
+    back_or_cancel = "adm:cancel" if for_admin else "cancel"
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=back_or_cancel)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_clients(ns: str, project: str, include_all_for_status: bool = False) -> InlineKeyboardMarkup:
+def kb_clients(project: str, include_all_for_status: bool = False, admin_flow: bool=False) -> InlineKeyboardMarkup:
     clients = get_clients(project)
+    prefix = "adm" if admin_flow else "proj"
     buttons: List[InlineKeyboardButton] = []
     for c in clients:
-        buttons.append(InlineKeyboardButton(text=c, callback_data=f"{ns}:client:{project}:{c}"))
+        buttons.append(InlineKeyboardButton(text=c, callback_data=f"{prefix}:client:{project}:{c}"))
     if include_all_for_status:
-        buttons.insert(0, InlineKeyboardButton(text="Все клиенты", callback_data=f"{ns}:client:{project}:*"))
+        buttons.insert(0, InlineKeyboardButton(text="Все клиенты", callback_data=f"status:client:{project}:*"))
     rows = rows_of(buttons, cols=2)
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{ns}:back:projects")])
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{ns}:cancel")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"back:projects")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_stores(ns: str, project: str, client: Optional[str], for_greenworks_vertical: bool, show_delete: bool = False) -> InlineKeyboardMarkup:
-    stores = get_stores(project, client=None if show_delete else client)  # для удаления — показываем все
-    # индексируем для безопасного короткого callback
-    buttons: List[InlineKeyboardButton] = []
-    for idx, s in enumerate(stores):
-        title = s["name"]
-        if show_delete:
-            cb = f"{ns}:store:{project}:{idx}"
-        else:
-            cb = f"{ns}:store:{project}:{(client or '-') }:{idx}"
-        buttons.append(InlineKeyboardButton(text=title, callback_data=cb))
-    cols = 1 if (project == GREENWORKS and for_greenworks_vertical) else 2
-    rows = rows_of(buttons, cols=cols)
-    # back
-    if show_delete:
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{ns}:back:projects")])
-        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{ns}:cancel")])
+def kb_stores(project: str, client: Optional[str], admin_flow: bool=False, vertical_greenworks: bool=True) -> InlineKeyboardMarkup:
+    """
+    Для GREENWORKS – вертикально.
+    Для остальных – 2 колонки.
+    """
+    stores = get_stores(project, client)
+    prefix = "adm" if admin_flow else "proj"
+
+    buttons = [InlineKeyboardButton(text=s, callback_data=f"{prefix}:store:{project}:{client or '*'}:{s}") for s in stores]
+
+    if project == "GREENWORKS" and vertical_greenworks:
+        rows = rows_of(buttons, cols=1)
     else:
-        # назад либо к клиентам (если есть), либо к проектам
-        if get_clients(project):
-            rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{ns}:back:clients:{project}")])
-        else:
-            rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{ns}:back:projects")])
-        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{ns}:cancel")])
+        rows = rows_of(buttons, cols=2)
+
+    # Назад
+    if is_multi(project):
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"back:clients:{project}")])
+    else:
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"back:projects")])
+    # Отмена
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_done_cancel() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Готово", callback_data="report:done"),
-    ], [
-        InlineKeyboardButton(text="❌ Отмена", callback_data="report:cancel"),
-    ]])
+def kb_delstore_chooser(project: str) -> InlineKeyboardMarkup:
+    """
+    Для удаления магазина в GREENWORKS не требуем выбирать клиента:
+    показываем общий список «магазин (клиент)».
+    Для остальных - просто список.
+    """
+    p = load_projects()
+    data = p.get(project, {})
+    btns: List[InlineKeyboardButton] = []
 
-def kb_confirm_delete_project(slug: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🗑 Удалить проект", callback_data=f"admdelproj:confirm:{slug}:yes"),
-    ], [
-        InlineKeyboardButton(text="⬅️ Назад", callback_data="admdelproj:back:projects"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="admdelproj:cancel"),
-    ]])
+    if data.get("type") == "multi":
+        for c in data.get("clients", []):
+            for s in data.get("stores", {}).get(c, []):
+                btns.append(InlineKeyboardButton(text=f"{s} ({c})", callback_data=f"adm:delstore:{project}:{c}:{s}"))
+        rows = rows_of(btns, cols=1)  # вертикально
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:back:projects")])
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+    else:
+        for s in data.get("stores", []):
+            btns.append(InlineKeyboardButton(text=s, callback_data=f"adm:delstore:{project}:*:{s}"))
+        rows = rows_of(btns, cols=2)
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:back:projects")])
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ================== СОСТОЯНИЯ ==================
-class ReportFSM(StatesGroup):
-    choose_project = State()
-    choose_client = State()
-    choose_store = State()
-    wait_photos = State()
+# ============ БОТ ============
+bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
 
-class AddStoreFSM(StatesGroup):
-    choose_project = State()
-    choose_client = State()
-    wait_name = State()
+# ============ ХЭЛПЕРЫ UI ============
+async def safe_delete_message(chat_id: int, message_id: int):
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
 
-class DelStoreFSM(StatesGroup):
-    choose_project = State()
-    choose_store = State()
+async def prompt_clean_and_ask_store(message: Message, project: str, client: Optional[str], state: FSMContext):
+    # очистим предыдущую «менюху», если была
+    data = await state.get_data()
+    last_menu_id = data.get("last_menu_msg_id")
+    if last_menu_id:
+        await safe_delete_message(message.chat.id, last_menu_id)
 
-class DelProjectFSM(StatesGroup):
-    choose_project = State()
-    confirm = State()
+    kb = kb_stores(project, client, admin_flow=False, vertical_greenworks=True)
+    m = await message.answer(
+        f"Выберите магазин для проекта <b>{project}</b>" + (f"\nКлиент: {client}" if client else ""),
+        reply_markup=kb
+    )
+    await state.update_data(last_menu_msg_id=m.message_id)
 
-class StatusFSM(StatesGroup):
-    choose_project = State()
-    choose_client = State()
-
-# ================== ИНИЦИАЛИЗАЦИЯ ==================
-router = Router()
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-# ================== КОМАНДЫ ==================
-@router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
+# ============ КОМАНДЫ ПОЛЬЗОВАТЕЛЕЙ ============
+@dp.message(Command("start"))
+async def start_cmd(message: Message, state: FSMContext):
     await state.clear()
     text = (
         "Привет! 👋\n\n"
-        "Основные команды:\n"
+        "Команды:\n"
         "• /otchet — отправить фотоотчёт\n"
-        "• /status — статус «сдали / не сдали» (админ)\n"
-        "• /addstore — добавить магазин (админ)\n"
-        "• /delstore — удалить магазин (админ)\n"
-        "• /delproject — удалить проект целиком (админ)"
+        "• /status — статус сдачи за неделю\n"
+        "\nАдмин-команды:\n"
+        "• /addstore — добавить магазин\n"
+        "• /delstore — удалить магазин\n"
+        "• /delproject — удалить проект целиком\n"
     )
     await message.answer(text)
 
-# ----------- ОТЧЁТ -----------
-@router.message(Command("otchet"))
-async def cmd_otchet(message: Message, state: FSMContext):
+@dp.message(Command("otchet"))
+async def cmd_report(message: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(ReportFSM.choose_project)
-    await message.answer("Выберите проект:", reply_markup=kb_projects("report", admin=False))
+    kb = kb_projects(for_admin=False)
+    m = await message.answer("Выберите проект:", reply_markup=kb)
+    await state.update_data(flow="report", last_menu_msg_id=m.message_id)
+    await state.set_state(Report.waiting_project)
 
-@router.callback_query(F.data.startswith("report:proj:"), ReportFSM.choose_project)
-async def report_pick_project(cb: CallbackQuery, state: FSMContext):
-    _, _, slug = cb.data.split(":", 2)
-    await cb.answer()
-    clients = get_clients(slug)
-    await state.update_data(project=slug)
-    if clients:
-        await state.set_state(ReportFSM.choose_client)
-        await cb.message.edit_text("Выберите клиента:", reply_markup=kb_clients("report", slug))
-    else:
-        await state.set_state(ReportFSM.choose_store)
-        await cb.message.edit_text("Выберите магазин:", reply_markup=kb_stores("report", slug, client=None, for_greenworks_vertical=True))
-
-@router.callback_query(F.data.startswith("report:client:"), ReportFSM.choose_client)
-async def report_pick_client(cb: CallbackQuery, state: FSMContext):
-    _, _, slug, client = cb.data.split(":", 3)
-    await cb.answer()
-    if client == "*":
-        client = None
-    await state.update_data(client=client)
-    await state.set_state(ReportFSM.choose_store)
-    await cb.message.edit_text(
-        "Выберите магазин:",
-        reply_markup=kb_stores("report", slug, client=client, for_greenworks_vertical=True)
-    )
-
-@router.callback_query(F.data.startswith("report:store:"), ReportFSM.choose_store)
-async def report_pick_store(cb: CallbackQuery, state: FSMContext):
-    # report:store:<project>:<client or ->:<idx>
-    parts = cb.data.split(":")
-    _, _, slug, client_or_dash, idx_s = parts
-    client = None if client_or_dash == "-" else client_or_dash
-    idx = int(idx_s)
-    stores = get_stores(slug, client=client)
-    if not (0 <= idx < len(stores)):
-        await cb.answer("Не найдено", show_alert=True)
-        return
-    store_name = stores[idx]["name"]
-    await state.update_data(project=slug, client=client, store_index=idx, store_name=store_name)
-
-    await cb.answer()
-    # удаляем клавиатуру выбора магазина
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
-
-    await state.set_state(ReportFSM.wait_photos)
-    await cb.message.bot.send_message(
-        cb.from_user.id,
-        f"📸 Отправляй фото для:\n<b>{slug}</b>\n{('Клиент: ' + client + '\n') if client else ''}"
-        f"Магазин: <b>{store_name}</b>\n\n"
-        "Когда закончишь — нажми «Готово».",
-        reply_markup=kb_done_cancel()
-    )
-
-@router.message(F.photo, ReportFSM.wait_photos)
-async def report_receive_photo(message: Message, state: FSMContext):
-    # помечаем как сданный при первом фото
-    data = await state.get_data()
-    slug = data.get("project")
-    store_name = data.get("store_name")
-    if slug and store_name:
-        mark_submitted(slug, store_name)
-    # можно просто подтвердить
-    await message.answer("✅ Фото получено. Ещё можно присылать. Нажми «Готово» когда закончишь.")
-
-@router.callback_query(F.data == "report:done", ReportFSM.wait_photos)
-async def report_done(cb: CallbackQuery, state: FSMContext):
-    await cb.answer("Готово!")
-    await state.clear()
-    await cb.message.edit_text("Спасибо! Отчёт сохранён на эту неделю ✅")
-
-@router.callback_query(F.data == "report:cancel")
-async def report_cancel(cb: CallbackQuery, state: FSMContext):
-    await cb.answer("Отменено")
-    await state.clear()
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
-
-@router.callback_query(F.data.startswith("report:back:"))
-async def report_back(cb: CallbackQuery, state: FSMContext):
-    # report:back:projects | report:back:clients:<project>
-    parts = cb.data.split(":")
-    await cb.answer()
-    if parts[2] == "projects":
-        await state.set_state(ReportFSM.choose_project)
-        await cb.message.edit_text("Выберите проект:", reply_markup=kb_projects("report", admin=False))
-    elif parts[2] == "clients":
-        slug = parts[3]
-        await state.set_state(ReportFSM.choose_client)
-        await cb.message.edit_text("Выберите клиента:", reply_markup=kb_clients("report", slug))
-    else:
-        await cb.answer()
-
-# ----------- СТАТУС (АДМИН) -----------
-@router.message(Command("status"))
+@dp.message(Command("status"))
 async def cmd_status(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("Доступ только для администратора.")
+    await state.clear()
+    kb = kb_projects(for_admin=True)
+    m = await message.answer("Статус: выберите проект:", reply_markup=kb)
+    await state.update_data(flow="status", last_menu_msg_id=m.message_id)
+    await state.set_state(StatusFlow.waiting_project)
+
+# ============ АДМИН КОМАНДЫ ============
+def ensure_admin(user_id: int) -> bool:
+    return user_id in ADMINS
+
+@dp.message(Command("addstore"))
+async def addstore_start(message: Message, state: FSMContext):
+    if not ensure_admin(message.from_user.id):
+        await message.answer("⛔️ Недостаточно прав.")
         return
     await state.clear()
-    await state.set_state(StatusFSM.choose_project)
-    await message.answer("Статус: выберите проект:", reply_markup=kb_projects("admstatus", admin=True))
+    kb = kb_projects(for_admin=True)
+    m = await message.answer("Добавить магазин: выберите проект:", reply_markup=kb)
+    await state.update_data(flow="add", last_menu_msg_id=m.message_id)
+    await state.set_state(AdminAdd.waiting_project)
 
-@router.callback_query(F.data.startswith("admstatus:proj:"), StatusFSM.choose_project)
-async def status_pick_proj(cb: CallbackQuery, state: FSMContext):
-    _, _, slug = cb.data.split(":", 2)
-    await cb.answer()
-    await state.update_data(project=slug)
-    clients = get_clients(slug)
-    if clients:
-        await state.set_state(StatusFSM.choose_client)
-        await cb.message.edit_text("Статус: выберите клиента:", reply_markup=kb_clients("admstatus", slug, include_all_for_status=True))
+@dp.message(Command("delstore"))
+async def delstore_start(message: Message, state: FSMContext):
+    if not ensure_admin(message.from_user.id):
+        await message.answer("⛔️ Недостаточно прав.")
+        return
+    await state.clear()
+    kb = kb_projects(for_admin=True)
+    m = await message.answer("Удалить магазин: выберите проект:", reply_markup=kb)
+    await state.update_data(flow="delstore", last_menu_msg_id=m.message_id)
+    await state.set_state(AdminDelStore.waiting_project)
+
+@dp.message(Command("delproject"))
+async def delproject_start(message: Message, state: FSMContext):
+    if not ensure_admin(message.from_user.id):
+        await message.answer("⛔️ Недостаточно прав.")
+        return
+    await state.clear()
+    names = list_projects()
+    if not names:
+        await message.answer("Нет проектов для удаления.")
+        return
+    builder = InlineKeyboardBuilder()
+    for p in names:
+        builder.button(text=f"Удалить {p}", callback_data=f"adm:delproject:{p}")
+    builder.button(text="❌ Отмена", callback_data="adm:cancel")
+    builder.adjust(1)
+    m = await message.answer("Выберите проект для удаления (безвозвратно):", reply_markup=builder.as_markup())
+    await state.update_data(flow="delproject", last_menu_msg_id=m.message_id)
+    await state.set_state(AdminDelProject.confirm)
+
+# ============ КОЛБЭКИ ОБЩИЕ ============
+@dp.callback_query(F.data == "cancel")
+async def cb_cancel(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.answer("Отменено", show_alert=False)
+    await c.message.edit_text("Операция отменена.")
+
+@dp.callback_query(F.data == "adm:cancel")
+async def cb_adm_cancel(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.answer("Отменено", show_alert=False)
+    await c.message.edit_text("Админ-операция отменена.")
+
+# ============ КОЛБЭКИ ДЛЯ /otchet ============
+@dp.callback_query(Report.waiting_project, F.data.startswith("proj:"))
+async def cb_report_pick_project(c: CallbackQuery, state: FSMContext):
+    project = c.data.split(":", 1)[1]
+    await c.answer()
+
+    # Сносим предыдущее меню-сообщение (если было)
+    data = await state.get_data()
+    last_menu_id = data.get("last_menu_msg_id")
+    if last_menu_id:
+        await safe_delete_message(c.message.chat.id, last_menu_id)
+
+    if is_multi(project):
+        kb = kb_clients(project, include_all_for_status=False, admin_flow=False)
+        m = await c.message.answer(f"Проект: <b>{project}</b>\nВыберите клиента:", reply_markup=kb)
+        await state.update_data(project=project, last_menu_msg_id=m.message_id)
+        await state.set_state(Report.waiting_client)
     else:
-        # сразу показываем статус
-        await show_status(cb, slug, None)
-        await state.clear()
+        # Идем сразу к списку магазинов
+        await state.update_data(project=project, client=None)
+        kb = kb_stores(project, client=None, admin_flow=False, vertical_greenworks=True)
+        m = await c.message.answer(f"Проект: <b>{project}</b>\nВыберите магазин:", reply_markup=kb)
+        await state.update_data(last_menu_msg_id=m.message_id)
+        await state.set_state(Report.waiting_store)
 
-@router.callback_query(F.data.startswith("admstatus:client:"), StatusFSM.choose_client)
-async def status_pick_client(cb: CallbackQuery, state: FSMContext):
-    _, _, slug, client = cb.data.split(":", 3)
-    await cb.answer()
+@dp.callback_query(Report.waiting_client, F.data.startswith("proj:client:"))
+async def cb_report_pick_client(c: CallbackQuery, state: FSMContext):
+    _, _, project, client = c.data.split(":", 3)
+    await c.answer()
+    await state.update_data(project=project, client=client)
+    await prompt_clean_and_ask_store(c.message, project, client, state)
+    await state.set_state(Report.waiting_store)
+
+@dp.callback_query(Report.waiting_store, F.data.startswith("proj:store:"))
+async def cb_report_pick_store(c: CallbackQuery, state: FSMContext):
+    # proj:store:PROJECT:CLIENT_OR_*:STORE
+    _, _, project, client, store = c.data.split(":", 4)
     if client == "*":
         client = None
-    await show_status(cb, slug, client)
-    await state.clear()
+    await c.answer()
 
-async def show_status(cb: CallbackQuery, slug: str, client: Optional[str]):
-    all_stores = [s["name"] for s in get_stores(slug, client=client)]
-    submitted_map = get_submitted(slug)
-    submitted = [s for s in all_stores if submitted_map.get(s)]
-    not_submitted = [s for s in all_stores if s not in submitted]
-    wl = week_label_msk()
-    txt = (
-        f"📊 Статус за неделю {wl}\n<b>{slug}</b>{(' • ' + client) if client else ''}\n\n"
-        f"✅ Сдали ({len(submitted)}):\n" + ("\n".join(submitted) if submitted else "—") + "\n\n"
-        f"❌ Не сдали ({len(not_submitted)}):\n" + ("\n".join(not_submitted) if not_submitted else "—")
-    )
-    await cb.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="⬅️ Назад", callback_data="admstatus:back:projects"),
-        InlineKeyboardButton(text="❌ Закрыть", callback_data="admstatus:cancel"),
-    ]]))
-
-@router.callback_query(F.data == "admstatus:cancel")
-async def status_cancel(cb: CallbackQuery, state: FSMContext):
-    await cb.answer("Закрыто")
-    await state.clear()
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
-
-@router.callback_query(F.data == "admstatus:back:projects")
-async def status_back_to_projects(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    await state.set_state(StatusFSM.choose_project)
-    await cb.message.edit_text("Статус: выберите проект:", reply_markup=kb_projects("admstatus", admin=True))
-
-# ----------- ДОБАВИТЬ МАГАЗИН (АДМИН) -----------
-@router.message(Command("addstore"))
-async def cmd_addstore(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("Доступ только для администратора.")
-        return
-    await state.clear()
-    await state.set_state(AddStoreFSM.choose_project)
-    await message.answer("Добавить магазин: выберите проект:", reply_markup=kb_projects("admadd", admin=True))
-
-@router.callback_query(F.data.startswith("admadd:proj:"), AddStoreFSM.choose_project)
-async def addstore_pick_project(cb: CallbackQuery, state: FSMContext):
-    _, _, slug = cb.data.split(":", 2)
-    await cb.answer()
-    await state.update_data(project=slug)
-    clients = get_clients(slug)
-    if clients:
-        await state.set_state(AddStoreFSM.choose_client)
-        await cb.message.edit_text("К какому клиенту добавить магазин?", reply_markup=kb_clients("admadd", slug))
-    else:
-        await state.set_state(AddStoreFSM.wait_name)
-        await cb.message.edit_text("Пришлите название магазина (или нажмите «Отмена»).",
-                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                                       InlineKeyboardButton(text="⬅️ Назад", callback_data="admadd:back:projects"),
-                                       InlineKeyboardButton(text="❌ Отмена", callback_data="admadd:cancel"),
-                                   ]]))
-
-@router.callback_query(F.data.startswith("admadd:client:"), AddStoreFSM.choose_client)
-async def addstore_pick_client(cb: CallbackQuery, state: FSMContext):
-    _, _, slug, client = cb.data.split(":", 3)
-    await cb.answer()
-    await state.update_data(project=slug, client=client)
-    await state.set_state(AddStoreFSM.wait_name)
-    await cb.message.edit_text(
-        f"Клиент: {client}\nПришлите название магазина.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="admadd:back:projects"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="admadd:cancel"),
-        ]])
-    )
-
-@router.message(AddStoreFSM.wait_name)
-async def addstore_receive_name(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("Пустое имя. Пришли название или нажми «Отмена».")
-        return
+    # Сносим меню при выборе
     data = await state.get_data()
-    slug = data.get("project")
-    client = data.get("client")  # None для PIT/CROWN; выбранный для GREENWORKS
-    add_store(slug, text, client)
-    await state.clear()
-    await message.answer(f"✅ Магазин «{text}» добавлен в проект {slug}.")
+    last_menu_id = data.get("last_menu_msg_id")
+    if last_menu_id:
+        await safe_delete_message(c.message.chat.id, last_menu_id)
 
-@router.callback_query(F.data == "admadd:cancel")
-async def addstore_cancel(cb: CallbackQuery, state: FSMContext):
-    await cb.answer("Отменено")
-    await state.clear()
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
+    # Сообщение «отправляй фото»
+    title_lines = [f"📸 Отправляй фото для:\n<b>{store}</b>"]
+    if client:
+        title_lines.append(f"Клиент: {client}")
+    text = "\n".join(title_lines)
 
-@router.callback_query(F.data == "admadd:back:projects")
-async def addstore_back_projects(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    await state.set_state(AddStoreFSM.choose_project)
-    await cb.message.edit_text("Добавить магазин: выберите проект:", reply_markup=kb_projects("admadd", admin=True))
+    m = await c.message.answer(text)
+    # Сохраняем контекст
+    await state.update_data(project=project, client=client, store=store, anchor_msg_id=m.message_id)
+    await state.set_state(Report.waiting_photos)
 
-# ----------- УДАЛИТЬ МАГАЗИН (АДМИН) -----------
-@router.message(Command("delstore"))
-async def cmd_delstore(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("Доступ только для администратора.")
-        return
-    await state.clear()
-    await state.set_state(DelStoreFSM.choose_project)
-    await message.answer("Удалить магазин: выберите проект:", reply_markup=kb_projects("admdel", admin=True))
+# Приём фото
+@dp.message(Report.waiting_photos, F.content_type == ContentType.PHOTO)
+async def handle_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    project = data.get("project")
+    client  = data.get("client")
+    store   = data.get("store")
 
-@router.callback_query(F.data.startswith("admdel:proj:"), DelStoreFSM.choose_project)
-async def delstore_pick_project(cb: CallbackQuery, state: FSMContext):
-    _, _, slug = cb.data.split(":", 2)
-    await cb.answer()
-    await state.update_data(project=slug)
-    await state.set_state(DelStoreFSM.choose_store)
-    await cb.message.edit_text(
-        "Выберите магазин для удаления:",
-        reply_markup=kb_stores("admdel", slug, client=None, for_greenworks_vertical=True, show_delete=True)
-    )
+    # Здесь у тебя может быть логика сохранения файла в Я.Диск через API.
+    # Сейчас ограничимся отметкой «сдал отчёт».
+    mark_submitted(project, store, client)
 
-@router.callback_query(F.data.startswith("admdel:store:"), DelStoreFSM.choose_store)
-async def delstore_do_delete(cb: CallbackQuery, state: FSMContext):
-    # admdel:store:<project>:<idx>
-    _, _, slug, idx_s = cb.data.split(":")
-    idx = int(idx_s)
-    name = del_store(slug, idx)
-    await cb.answer()
-    if name:
-        # обновим список
-        await cb.message.edit_text(
-            f"🗑 Удалено: {name}\n\nВыберите следующий магазин или «Назад».",
-            reply_markup=kb_stores("admdel", slug, client=None, for_greenworks_vertical=True, show_delete=True)
-        )
-    else:
-        await cb.message.edit_text(
-            "Не удалось удалить (не найдено).",
-            reply_markup=kb_stores("admdel", slug, client=None, for_greenworks_vertical=True, show_delete=True)
-        )
+    await message.answer("✅ Принял фото. Спасибо!")
+    # останемся в этом же состоянии — можно кидать ещё фото
+    # (или /start чтобы выйти)
 
-@router.callback_query(F.data == "admdel:cancel")
-async def delstore_cancel(cb: CallbackQuery, state: FSMContext):
-    await cb.answer("Отменено")
-    await state.clear()
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
+@dp.callback_query(F.data.startswith("back:"))
+async def cb_back(c: CallbackQuery, state: FSMContext):
+    """
+    Единая обработка «Назад»:
+    back:projects
+    back:clients:<PROJECT>
+    """
+    await c.answer()
+    parts = c.data.split(":")
+    where = parts[1]
 
-@router.callback_query(F.data == "admdel:back:projects")
-async def delstore_back_projects(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    await state.set_state(DelStoreFSM.choose_project)
-    await cb.message.edit_text("Удалить магазин: выберите проект:", reply_markup=kb_projects("admdel", admin=True))
+    data = await state.get_data()
+    last_menu_id = data.get("last_menu_msg_id")
+    if last_menu_id:
+        await safe_delete_message(c.message.chat.id, last_menu_id)
 
-# ----------- УДАЛИТЬ ПРОЕКТ (АДМИН) -----------
-@router.message(Command("delproject"))
-async def cmd_delproject(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("Доступ только для администратора.")
-        return
-    await state.clear()
-    await state.set_state(DelProjectFSM.choose_project)
-    await message.answer("Удалить проект: выберите проект:", reply_markup=kb_projects("admdelproj", admin=True))
-
-@router.callback_query(F.data.startswith("admdelproj:proj:"), DelProjectFSM.choose_project)
-async def delproject_pick(cb: CallbackQuery, state: FSMContext):
-    _, _, slug = cb.data.split(":", 2)
-    await cb.answer()
-    await state.update_data(project=slug)
-    await state.set_state(DelProjectFSM.confirm)
-    await cb.message.edit_text(
-        f"Подтвердите удаление проекта <b>{slug}</b> и всех его магазинов:",
-        reply_markup=kb_confirm_delete_project(slug)
-    )
-
-@router.callback_query(F.data.startswith("admdelproj:confirm:"), DelProjectFSM.confirm)
-async def delproject_confirm(cb: CallbackQuery, state: FSMContext):
-    _, _, slug, answer = cb.data.split(":")
-    await cb.answer()
-    if answer == "yes":
-        ok = del_project(slug)
-        await state.clear()
-        if ok:
-            await cb.message.edit_text(f"✅ Проект {slug} удалён целиком.")
+    if where == "projects":
+        flow = data.get("flow", "report")
+        for_admin = (flow in ("add", "delstore", "status"))
+        kb = kb_projects(for_admin=for_admin)
+        m = await c.message.answer("Выберите проект:", reply_markup=kb)
+        await state.update_data(last_menu_msg_id=m.message_id)
+        if flow == "report":
+            await state.set_state(Report.waiting_project)
+        elif flow == "add":
+            await state.set_state(AdminAdd.waiting_project)
+        elif flow == "delstore":
+            await state.set_state(AdminDelStore.waiting_project)
+        elif flow == "status":
+            await state.set_state(StatusFlow.waiting_project)
         else:
-            await cb.message.edit_text("Не удалось удалить проект (не найден).")
+            await state.clear()
+        return
+
+    if where == "clients":
+        project = parts[2] if len(parts) > 2 else data.get("project")
+        kb = kb_clients(project, include_all_for_status=False, admin_flow=False)
+        m = await c.message.answer(f"Проект: <b>{project}</b>\nВыберите клиента:", reply_markup=kb)
+        await state.update_data(last_menu_msg_id=m.message_id)
+        await state.set_state(Report.waiting_client)
+        return
+
+# ============ КОЛБЭКИ ДЛЯ /status ============
+@dp.callback_query(StatusFlow.waiting_project, F.data.startswith("proj:"))
+async def cb_status_pick_project(c: CallbackQuery, state: FSMContext):
+    project = c.data.split(":", 1)[1]
+    await c.answer()
+    await state.update_data(project=project)
+
+    # Сносим
+    data = await state.get_data()
+    last_menu_id = data.get("last_menu_msg_id")
+    if last_menu_id:
+        await safe_delete_message(c.message.chat.id, last_menu_id)
+
+    if is_multi(project):
+        kb = kb_clients(project, include_all_for_status=True, admin_flow=False)
+        m = await c.message.answer("Статус: выберите клиента или «Все клиенты»:", reply_markup=kb)
+        await state.update_data(last_menu_msg_id=m.message_id)
+        await state.set_state(StatusFlow.waiting_client)
     else:
-        await cb.message.edit_text("Операция отменена.")
-        await state.clear()
+        done, not_done = get_week_status(project, None)
+        text = [
+            f"📊 Статус за неделю {current_week_label()}",
+            f"Проект: <b>{project}</b>",
+            "",
+            f"✅ Сдали ({len(done)}):",
+        ]
+        text += [f"• {x}" for x in done] if done else ["—"]
+        text += ["", f"❌ Не сдали ({len(not_done)}):"]
+        text += [f"• {x}" for x in not_done] if not_done else ["—"]
+        await c.message.edit_text("\n".join(text))
 
-@router.callback_query(F.data == "admdelproj:cancel")
-async def delproject_cancel(cb: CallbackQuery, state: FSMContext):
-    await cb.answer("Отменено")
+@dp.callback_query(StatusFlow.waiting_client, F.data.startswith("status:client:"))
+async def cb_status_pick_client(c: CallbackQuery, state: FSMContext):
+    # status:client:PROJECT:* or :CLIENT
+    _, _, project, client = c.data.split(":", 3)
+    await c.answer()
+    if client == "*":
+        client_opt = None
+    else:
+        client_opt = client
+
+    done, not_done = get_week_status(project, client_opt)
+    header = f"📊 Статус за неделю {current_week_label()}\nПроект: <b>{project}</b>"
+    if client_opt:
+        header += f"\nКлиент: {client_opt}"
+
+    text = [header, "", f"✅ Сдали ({len(done)}):"]
+    text += [f"• {x}" for x in done] if done else ["—"]
+    text += ["", f"❌ Не сдали ({len(not_done)}):"]
+    text += [f"• {x}" for x in not_done] if not_done else ["—"]
+
+    await c.message.edit_text("\n".join(text))
+
+# ============ КОЛБЭКИ ДЛЯ /addstore ============
+@dp.callback_query(AdminAdd.waiting_project, F.data.startswith("proj:"))
+async def cb_add_pick_project(c: CallbackQuery, state: FSMContext):
+    project = c.data.split(":", 1)[1]
+    await c.answer()
+    await state.update_data(project=project)
+
+    # снести пред. меню
+    data = await state.get_data()
+    last_menu_id = data.get("last_menu_msg_id")
+    if last_menu_id:
+        await safe_delete_message(c.message.chat.id, last_menu_id)
+
+    if is_multi(project):
+        kb = kb_clients(project, include_all_for_status=False, admin_flow=True)
+        m = await c.message.answer(f"Проект: <b>{project}</b>\nВыберите клиента:", reply_markup=kb)
+        await state.update_data(last_menu_msg_id=m.message_id)
+        await state.set_state(AdminAdd.waiting_client)
+    else:
+        await state.update_data(client=None)
+        m = await c.message.answer("Введите название магазина (текстом). Для отмены — /start")
+        await state.update_data(last_menu_msg_id=m.message_id)
+        await state.set_state(AdminAdd.waiting_name)
+
+@dp.callback_query(AdminAdd.waiting_client, F.data.startswith("adm:client:"))
+async def cb_add_pick_client(c: CallbackQuery, state: FSMContext):
+    _, _, project, client = c.data.split(":", 3)
+    await c.answer()
+    await state.update_data(project=project, client=client)
+
+    # снести пред. меню
+    data = await state.get_data()
+    last_menu_id = data.get("last_menu_msg_id")
+    if last_menu_id:
+        await safe_delete_message(c.message.chat.id, last_menu_id)
+
+    m = await c.message.answer("Введите название магазина (текстом). Для отмены — /start")
+    await state.update_data(last_menu_msg_id=m.message_id)
+    await state.set_state(AdminAdd.waiting_name)
+
+@dp.message(AdminAdd.waiting_name, F.text)
+async def cb_add_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    data = await state.get_data()
+    project = data.get("project")
+    client  = data.get("client")
+    if not name:
+        await message.answer("Пустое имя, введите ещё раз.")
+        return
+    if name.upper() in ("DELETE", "/DELETE", "DEL", "/DEL"):
+        await message.answer("❗️ Нельзя называть магазин «DELETE». Введите другое имя.")
+        return
+
+    ok = add_store(project, name, client)
+    if ok:
+        info = f"Добавлен магазин «{name}» в проект «{project}»"
+        if client:
+            info += f" (клиент: {client})"
+        await message.answer(f"✅ {info}")
+    else:
+        await message.answer("❌ Не удалось добавить магазин. Проверь проект/клиента.")
+
     await state.clear()
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
 
-@router.callback_query(F.data == "admdelproj:back:projects")
-async def delproject_back_projects(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    await state.set_state(DelProjectFSM.choose_project)
-    await cb.message.edit_text("Удалить проект: выберите проект:", reply_markup=kb_projects("admdelproj", admin=True))
+# ============ КОЛБЭКИ ДЛЯ /delstore ============
+@dp.callback_query(AdminDelStore.waiting_project, F.data.startswith("proj:"))
+async def cb_delstore_project(c: CallbackQuery, state: FSMContext):
+    project = c.data.split(":", 1)[1]
+    await c.answer()
+    await state.update_data(project=project)
 
-# ================== ЗАПУСК ==================
-async def main():
-    ensure_files()
-    bot = Bot(BOT_TOKEN, parse_mode="HTML")
-    dp = Dispatcher()
-    dp.include_router(router)
+    # снести пред. меню
+    data = await state.get_data()
+    last_menu_id = data.get("last_menu_msg_id")
+    if last_menu_id:
+        await safe_delete_message(c.message.chat.id, last_menu_id)
+
+    kb = kb_delstore_chooser(project)
+    m = await c.message.answer(f"Удаление магазина.\nПроект: <b>{project}</b>\nВыберите магазин:", reply_markup=kb)
+    await state.update_data(last_menu_msg_id=m.message_id)
+    await state.set_state(AdminDelStore.waiting_store)
+
+@dp.callback_query(AdminDelStore.waiting_store, F.data.startswith("adm:delstore:"))
+async def cb_delstore_confirm(c: CallbackQuery, state: FSMContext):
+    # adm:delstore:PROJECT:CLIENTOR* : STORE
+    _, _, project, client, store = c.data.split(":", 4)
+    await c.answer()
+    ok = del_store(project, store)
+    if ok:
+        await c.message.edit_text(f"🗑 Удалён магазин <b>{store}</b> из проекта <b>{project}</b>.")
+    else:
+        await c.message.edit_text("❌ Не удалось удалить магазин.")
+    await state.clear()
+
+# ============ КОЛБЭКИ ДЛЯ /delproject ============
+@dp.callback_query(AdminDelProject.confirm, F.data.startswith("adm:delproject:"))
+async def cb_delproject(c: CallbackQuery, state: FSMContext):
+    project = c.data.split(":", 2)[2]
+    await c.answer()
+    ok = del_project(project)
+    if ok:
+        await c.message.edit_text(f"🧨 Проект <b>{project}</b> удалён вместе со списком магазинов.")
+    else:
+        await c.message.edit_text("❌ Не удалось удалить проект.")
+    await state.clear()
+
+# ============ СИСТЕМНОЕ ============
+async def on_startup():
+    ensure_seed()
     log.info("✅ Бот запущен и слушает Telegram...")
-    await dp.start_polling(bot)
 
+# aiogram v3: стартуем поллинг
 if __name__ == "__main__":
+    import asyncio
+    async def main():
+        ensure_seed()
+        await on_startup()
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        log.info("⏹ Остановлено")
-
+        log.warning("Bot stopped")
