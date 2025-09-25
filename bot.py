@@ -1,821 +1,573 @@
-# bot.py
-# -*- coding: utf-8 -*-
-
+# bot.py — отчёты без спама, неделя по Москве, admin: /status /addstore /delstore
 import os
+import re
 import json
+import asyncio
 import logging
+import requests
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Any, List, Tuple, Optional, Set
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode, ContentType
-from aiogram.filters import Command
 from aiogram.types import (
     Message,
     CallbackQuery,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeChat,
 )
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
 
-# ============ НАСТРОЙКИ ЛОГГЕРА ============
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s:%(name)s:%(message)s"
-)
-log = logging.getLogger("bot")
+# ======= ТОКЕНЫ =======
+TELEGRAM_TOKEN = "8306801846:AAEvDQFoiepNmDaxPi5UVDqiNWmz6tUO_KQ"
+YANDEX_TOKEN   = "y0__xCmksrUBxjjojogmLvAsxTMieHo_qAobIbgob8lZd-uDHpoew"
 
-# ============ ТОКЕН ============
-# Твой токен из переписки, чтобы всё завелось без доп. правок.
-BOT_TOKEN = "8306801846:AAEvDQFoiepNmDaxPi5UVDqiNWmz6tUO_KQ"
+# ====== АДМИН ======
+ADMIN_ID = 445526501  # только этому пользователю доступны /status /addstore /delstore и видны в меню
 
-# Если захочешь — можно переключить на переменную окружения:
-# BOT_TOKEN = (
-#     os.getenv("BOT_TOKEN")
-#     or os.getenv("TELEGRAM_TOKEN")
-#     or os.getenv("TG_TOKEN")
-#     or "PASTE_YOUR_TOKEN_HERE"
-# )
+# ====== ЛОГИ И БОТ ======
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=TELEGRAM_TOKEN)
+dp  = Dispatcher()
 
-# ============ ФАЙЛЫ ДАННЫХ ============
-PROJECTS_FILE = os.path.join(os.path.dirname(__file__), "projects.json")
-SUBMIT_FILE   = os.path.join(os.path.dirname(__file__), "submissions.json")
+# ====== Константы ======
+SUMMARY_DELAY_SEC = 2.0  # пауза тишины для единственного статус-сообщения
+MSK = timezone(timedelta(hours=3))  # Москва
 
-# ============ КОНСТАНТЫ ============
-MSK_TZ = timezone(timedelta(hours=3))
+# ====== Файлы/данные ======
+STORES_FILE = "stores.json"
 
-ADMINS: List[int] = [
-    # Твой id уже был в логах.
-    445526501,
+# Начальное «семя» магазинов (если файла ещё нет)
+SEED_STORES: List[str] = [
+    "ОБИ 013 Белая дача",
+    "ОБИ 009 Варшавка",
+    "ОБИ 017 Новгород",
+    "ОБИ 006 Боровка",
+    "ОБИ 037 Авиапарк",
+    "ОБИ 039 Новая Рига",
+    "ОБИ 033 Рязань",
+    "ОБИ 023 Волгоград",
+    "ОБИ 042 Брянск",
+    "ОБИ 015 Парнас",
+    "ОБИ 001 Теплый стан",
+    "ОБИ 011 Федяково",
+    "ОБИ 016 Лахта",
+    "ОБИ 035 Митино",
+    "ОБИ 108 Казань",
 ]
 
-# Для статуса считаем «неделю» как ПН–ВС по МСК
-def current_week_label() -> str:
-    now = datetime.now(MSK_TZ)
-    start = now - timedelta(days=now.weekday())
-    end = start + timedelta(days=6)
+# База папки на Яндекс.Диске
+YANDEX_BASE = "/Sam/Проект Crown/Фотоотчеты CROWN"
+
+# Сессии пользователей: состояния и временные файлы
+# user_id -> {"store": str, "files": List[str], "tmp_dir": str,
+#             "status_msg": Optional[Tuple[int,int]], "summary_task": Optional[asyncio.Task],
+#             "mode": Optional[str]}
+user_sessions: Dict[int, Dict[str, Any]] = {}
+
+# На всякий случай память об отправивших за неделю (fallback)
+# submitted_by_week["DD.MM-DD.MM"] = set(store_names)
+submitted_by_week: Dict[str, Set[str]] = {}
+
+# ===================== ХРАНИЛИЩЕ МАГАЗИНОВ =====================
+def load_stores() -> List[str]:
+    if not os.path.exists(STORES_FILE):
+        with open(STORES_FILE, "w", encoding="utf-8") as f:
+            json.dump(SEED_STORES, f, ensure_ascii=False, indent=2)
+        logging.info("stores.json created with seed list (%d)", len(SEED_STORES))
+        return list(SEED_STORES)
+    try:
+        with open(STORES_FILE, "r", encoding="utf-8") as f:
+            stores = json.load(f)
+            if not isinstance(stores, list):
+                raise ValueError("stores.json damaged")
+            return stores
+    except Exception as e:
+        logging.exception("load_stores error, fallback to seed: %s", e)
+        return list(SEED_STORES)
+
+def save_stores(stores: List[str]) -> None:
+    with open(STORES_FILE, "w", encoding="utf-8") as f:
+        json.dump(stores, f, ensure_ascii=False, indent=2)
+
+def normalize_name(name: str) -> str:
+    return re.sub(r"\s+", " ", name.strip())
+
+def is_store_name_valid(name: str) -> bool:
+    # Требуем формат: "ОБИ 123 Название"
+    return bool(re.match(r"^ОБИ\s+\d{3}\s+.+", name.strip(), flags=re.IGNORECASE))
+
+# ====== УТИЛИТЫ (Yandex) ======
+def ensure_folder_exists(folder_path: str) -> bool:
+    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
+    url = "https://cloud-api.yandex.net/v1/disk/resources"
+    params = {"path": folder_path}
+    try:
+        r = requests.put(url, headers=headers, params=params, timeout=30)
+        return r.status_code in (201, 409)
+    except Exception:
+        logging.exception("ensure_folder_exists error")
+        return False
+
+def upload_to_yandex(local_file: str, remote_path: str) -> bool:
+    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
+    url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
+    params = {"path": remote_path, "overwrite": "true"}
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        if resp.status_code != 200:
+            logging.error("Get upload href failed %s %s", resp.status_code, resp.text)
+            return False
+        upload_url = resp.json().get("href")
+        if not upload_url:
+            logging.error("No href in response")
+            return False
+        with open(local_file, "rb") as f:
+            r = requests.put(upload_url, files={"file": f}, timeout=120)
+        return r.status_code in (201, 202)
+    except Exception:
+        logging.exception("upload_to_yandex error")
+        return False
+
+def list_folder_children(folder_path: str) -> List[str]:
+    """Вернуть имена вложенных папок на Я.Диске для week_path."""
+    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
+    url = "https://cloud-api.yandex.net/v1/disk/resources"
+    params = {
+        "path": folder_path,
+        "limit": 1000,
+        "fields": "_embedded.items.name,_embedded.items.type"
+    }
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        if r.status_code != 200:
+            logging.warning("list_folder_children %s -> %s %s", folder_path, r.status_code, r.text)
+            return []
+        items = r.json().get("_embedded", {}).get("items", [])
+        return [it.get("name") for it in items if it.get("type") == "dir"]
+    except Exception:
+        logging.exception("list_folder_children error")
+        return []
+
+def get_week_folder(now: Optional[datetime] = None) -> str:
+    if now is None:
+        now = datetime.now(MSK)
+    else:
+        now = now.astimezone(MSK)
+    start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = (start + timedelta(days=6)).replace(hour=23, minute=59, second=59, microsecond=0)
     return f"{start.day:02}.{start.month:02}-{end.day:02}.{end.month:02}"
 
-# ============ ФСМ СОСТОЯНИЯ ============
-class Report(StatesGroup):
-    waiting_project = State()
-    waiting_client  = State()
-    waiting_store   = State()
-    waiting_photos  = State()
+# ====== КЛАВИАТУРЫ ======
+def build_stores_keyboard(stores: Optional[List[str]] = None) -> InlineKeyboardMarkup:
+    if stores is None:
+        stores = load_stores()
 
-class AdminAdd(StatesGroup):
-    waiting_project = State()
-    waiting_client  = State()
-    waiting_name    = State()
-    confirm         = State()
+    def store_key(s: str) -> int:
+        nums = re.findall(r"\d+", s)
+        return int(nums[-1]) if nums else 0
 
-class AdminDelStore(StatesGroup):
-    waiting_project = State()
-    waiting_store   = State()
-
-class AdminDelProject(StatesGroup):
-    confirm = State()
-
-class StatusFlow(StatesGroup):
-    waiting_project = State()
-    waiting_client  = State()
-
-# ============ УТИЛИТЫ ХРАНИЛИЩА ============
-def load_json(path: str, default):
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-def save_json(path: str, data) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-def ensure_seed():
-    projects = load_json(PROJECTS_FILE, default=None)
-    if projects is not None:
-        return  # уже есть
-
-    # Базы из окружения (если заданы) — не обязательно
-    pit_base = os.getenv("PIT_BASE", "/Sam/Проект PIT/Фотоотчеты PIT")
-    green_m_base = os.getenv("GREENWORKS_BASE_M", "/Sam/Проект Seasons/Фотоотчеты Greenworks seasons/Михаил")
-    green_a_base = os.getenv("GREENWORKS_BASE_A", "/Sam/Проект Seasons/Фотоотчеты Greenworks seasons/Александр")
-    crown_base = os.getenv("CROWN_BASE", "/Sam/Проект Crown/Фотоотчеты Crown")
-
-    # Твои магазины PIT (с фиксами «Новая Рига»)
-    pit_stores = [
-        "ОБИ 013 Белая дача",
-        "ОБИ 042 Брянск",
-        "ОБИ 006 Боровка",
-        "ОБИ 037 Авиапарк",
-        "ОБИ 039 Новая Рига",
-        "ОБИ 001 Теплый стан",
-    ]
-
-    # GREENWORKS Михаил
-    gw_m = [
-        "Бау Центр Дзержинка Калининград",
-        "Бау Центр Московский Калининград",
-        "Бау Центр Новороссийск",
-        "Бау Центр Пушкино",
-        "Дарвин Зеленоград",
-        "Дарвин Подольск",
-        "Дарвин Пушкино",
-        "Колорлон Новосибирск",
-        "Колорлон, Бредск",
-        "Петрович Дмитровка",
-        "Петрович Санкт-Петербург",
-    ]
-
-    # GREENWORKS Александр
-    gw_a = [
-        "Вектор Пенза",
-        "Дачник Демская",
-        "Дачник Романтиков",
-        "Моя Родня Окружная",
-        "Моя Родня Рахманинова",
-        "Моя Родня Терновского",
-        "Сарай (Ульяновск)",
-        "Строй-С Гвардейская",
-        "Строй-С Усть-Курдюмская",
-        "Юрат Чебоксары",
-    ]
-
-    projects_seed = {
-        "CROWN": {
-            "type": "simple",
-            "base": crown_base,
-            "stores": []  # ты магазины уже добивал вручную — оставляю пусто
-        },
-        "PIT": {
-            "type": "simple",
-            "base": pit_base,
-            "stores": pit_stores
-        },
-        "GREENWORKS": {
-            "type": "multi",
-            "clients": ["Михаил", "Александр"],
-            "bases": {
-                "Михаил": green_m_base,
-                "Александр": green_a_base
-            },
-            "stores": {
-                "Михаил": gw_m,
-                "Александр": gw_a
-            }
-        }
-    }
-    save_json(PROJECTS_FILE, projects_seed)
-    log.info("projects.json created with seed")
-
-def load_projects() -> dict:
-    return load_json(PROJECTS_FILE, default={})
-
-def save_projects(p: dict) -> None:
-    save_json(PROJECTS_FILE, p)
-
-def load_submissions() -> dict:
-    return load_json(SUBMIT_FILE, default={})
-
-def save_submissions(s: dict) -> None:
-    save_json(SUBMIT_FILE, s)
-
-def list_projects() -> List[str]:
-    p = load_projects()
-    return sorted(p.keys())
-
-def is_multi(project: str) -> bool:
-    p = load_projects()
-    data = p.get(project, {})
-    return data.get("type") == "multi"
-
-def get_clients(project: str) -> List[str]:
-    p = load_projects()
-    data = p.get(project, {})
-    if data.get("type") == "multi":
-        return data.get("clients", [])
-    return ["*"]
-
-def get_stores(project: str, client: Optional[str] = None) -> List[str]:
-    p = load_projects()
-    data = p.get(project, {})
-    if data.get("type") == "multi":
-        if not client:
-            return []  # для multi без клиента — ничего
-        return data.get("stores", {}).get(client, [])
-    # simple
-    return data.get("stores", [])
-
-def get_base_path(project: str, client: Optional[str] = None) -> str:
-    p = load_projects()
-    data = p.get(project, {})
-    if data.get("type") == "multi":
-        if not client:
-            return ""
-        bases = data.get("bases", {})
-        return bases.get(client, "")
-    return data.get("base", "")
-
-def add_store(project: str, name: str, client: Optional[str] = None) -> bool:
-    if name.strip().upper() in ("DELETE", "/DELETE", "DEL", "/DEL"):
-        return False  # не позволяем назвать магазин как команду
-    p = load_projects()
-    if project not in p:
-        return False
-    data = p[project]
-    if data.get("type") == "multi":
-        if not client:
-            return False
-        stores = data.setdefault("stores", {}).setdefault(client, [])
-        if name not in stores:
-            stores.append(name)
-    else:
-        stores = data.setdefault("stores", [])
-        if name not in stores:
-            stores.append(name)
-    save_projects(p)
-    return True
-
-def del_store(project: str, store: str) -> bool:
-    p = load_projects()
-    if project not in p:
-        return False
-    data = p[project]
-    changed = False
-    if data.get("type") == "multi":
-        for c in data.get("clients", []):
-            lst = data.get("stores", {}).get(c, [])
-            if store in lst:
-                lst.remove(store)
-                changed = True
-    else:
-        lst = data.get("stores", [])
-        if store in lst:
-            lst.remove(store)
-            changed = True
-    if changed:
-        save_projects(p)
-    return changed
-
-def del_project(project: str) -> bool:
-    p = load_projects()
-    if project not in p:
-        return False
-    p.pop(project)
-    save_projects(p)
-    # очищаем отправки по проекту
-    s = load_submissions()
-    week = current_week_label()
-    if week in s and project in s[week]:
-        s[week].pop(project, None)
-        save_submissions(s)
-    return True
-
-def mark_submitted(project: str, store: str, client: Optional[str]) -> None:
-    s = load_submissions()
-    week = current_week_label()
-    s.setdefault(week, {}).setdefault(project, {})
-    key = store if not client else f"{client}::{store}"
-    s[week][project][key] = True
-    save_submissions(s)
-
-def get_week_status(project: str, client: Optional[str]) -> Tuple[List[str], List[str]]:
-    """
-    Возвращает (сдали, не сдали) по текущей неделе.
-    Для GREENWORKS:
-      - если client=None => учитываем оба клиента
-      - если client задан => только его магазины
-    """
-    s = load_submissions()
-    p = load_projects()
-    week = current_week_label()
-
-    submitted: set = set()
-    if week in s and project in s[week]:
-        submitted = set(k for k, v in s[week][project].items() if v)
-
-    all_stores: List[Tuple[Optional[str], str]] = []
-    data = p.get(project, {})
-    if data.get("type") == "multi":
-        clients = data.get("clients", [])
-        for c in clients:
-            if (client is None) or (client == c):
-                for st in data.get("stores", {}).get(c, []):
-                    all_stores.append((c, st))
-    else:
-        for st in data.get("stores", []):
-            all_stores.append((None, st))
-
-    done, not_done = [], []
-    for c, st in all_stores:
-        key = st if not c else f"{c}::{st}"
-        label = st if not c else f"{st} ({c})"
-        if key in submitted:
-            done.append(label)
-        else:
-            not_done.append(label)
-    return (sorted(done), sorted(not_done))
-
-# ============ КЛАВИАТУРЫ ============
-def rows_of(buttons: List[InlineKeyboardButton], cols: int) -> List[List[InlineKeyboardButton]]:
-    if cols <= 1:
-        return [[b] for b in buttons]
-    return [buttons[i:i+cols] for i in range(0, len(buttons), cols)]
-
-def kb_projects(for_admin: bool = False) -> InlineKeyboardMarkup:
-    names = list_projects()
-    buttons = [InlineKeyboardButton(text=p, callback_data=f"proj:{p}") for p in names]
-    rows = rows_of(buttons, cols=2)
-    back_or_cancel = "adm:cancel" if for_admin else "cancel"
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=back_or_cancel)])
+    sorted_stores = sorted(stores, key=store_key)
+    buttons = [InlineKeyboardButton(text=s, callback_data=f"store:{i}") for i, s in enumerate(sorted_stores)]
+    rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_clients(project: str, include_all_for_status: bool = False, admin_flow: bool=False) -> InlineKeyboardMarkup:
-    clients = get_clients(project)
-    prefix = "adm" if admin_flow else "proj"
-    buttons: List[InlineKeyboardButton] = []
-    for c in clients:
-        buttons.append(InlineKeyboardButton(text=c, callback_data=f"{prefix}:client:{project}:{c}"))
-    if include_all_for_status:
-        buttons.insert(0, InlineKeyboardButton(text="Все клиенты", callback_data=f"status:client:{project}:*"))
-    rows = rows_of(buttons, cols=2)
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"back:projects")])
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+def build_send_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Отправить отчёт", callback_data="confirm_upload")]
+    ])
+
+def build_cancel_kb(tag: str) -> InlineKeyboardMarkup:
+    # tag нужен, чтобы отличать отмены разных режимов
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_cancel:{tag}")]
+    ])
+
+def build_del_list_kb(stores: List[str]) -> InlineKeyboardMarkup:
+    # список магазинов для удаления
+    buttons = [InlineKeyboardButton(text=s, callback_data=f"delpick:{i}") for i, s in enumerate(stores)]
+    rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel:del")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_stores(project: str, client: Optional[str], admin_flow: bool=False, vertical_greenworks: bool=True) -> InlineKeyboardMarkup:
-    """
-    Для GREENWORKS – вертикально.
-    Для остальных – 2 колонки.
-    """
-    stores = get_stores(project, client)
-    prefix = "adm" if admin_flow else "proj"
+def build_del_confirm_kb(index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Удалить", callback_data=f"delyes:{index}"),
+            InlineKeyboardButton(text="↩️ Назад", callback_data="delback")
+        ],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel:del")]
+    ])
 
-    buttons = [InlineKeyboardButton(text=s, callback_data=f"{prefix}:store:{project}:{client or '*'}:{s}") for s in stores]
+# ====== ХЭЛПЕРЫ СЕССИЙ ======
+def set_mode(user_id: int, mode: Optional[str]):
+    user_sessions.setdefault(user_id, {})
+    user_sessions[user_id]["mode"] = mode
 
-    if project == "GREENWORKS" and vertical_greenworks:
-        rows = rows_of(buttons, cols=1)
-    else:
-        rows = rows_of(buttons, cols=2)
+def get_mode(user_id: int) -> Optional[str]:
+    return user_sessions.get(user_id, {}).get("mode")
 
-    # Назад
-    if is_multi(project):
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"back:clients:{project}")])
-    else:
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"back:projects")])
-    # Отмена
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+async def schedule_summary_message(message: Message, user_id: int):
+    """Планирует показ ОДНОГО статус-сообщения после паузы SUMMARY_DELAY_SEC."""
+    session = user_sessions.setdefault(user_id, {})
 
-def kb_delstore_chooser(project: str) -> InlineKeyboardMarkup:
-    """
-    Для удаления магазина в GREENWORKS не требуем выбирать клиента:
-    показываем общий список «магазин (клиент)».
-    Для остальных - просто список.
-    """
-    p = load_projects()
-    data = p.get(project, {})
-    btns: List[InlineKeyboardButton] = []
-
-    if data.get("type") == "multi":
-        for c in data.get("clients", []):
-            for s in data.get("stores", {}).get(c, []):
-                btns.append(InlineKeyboardButton(text=f"{s} ({c})", callback_data=f"adm:delstore:{project}:{c}:{s}"))
-        rows = rows_of(btns, cols=1)  # вертикально
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:back:projects")])
-        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel")])
-        return InlineKeyboardMarkup(inline_keyboard=rows)
-    else:
-        for s in data.get("stores", []):
-            btns.append(InlineKeyboardButton(text=s, callback_data=f"adm:delstore:{project}:*:{s}"))
-        rows = rows_of(btns, cols=2)
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:back:projects")])
-        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="adm:cancel")])
-        return InlineKeyboardMarkup(inline_keyboard=rows)
-
-# ============ БОТ ============
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-
-# ============ ХЭЛПЕРЫ UI ============
-async def safe_delete_message(chat_id: int, message_id: int):
-    try:
-        await bot.delete_message(chat_id, message_id)
-    except Exception:
-        pass
-
-async def prompt_clean_and_ask_store(message: Message, project: str, client: Optional[str], state: FSMContext):
-    # очистим предыдущую «менюху», если была
-    data = await state.get_data()
-    last_menu_id = data.get("last_menu_msg_id")
-    if last_menu_id:
-        await safe_delete_message(message.chat.id, last_menu_id)
-
-    kb = kb_stores(project, client, admin_flow=False, vertical_greenworks=True)
-    m = await message.answer(
-        f"Выберите магазин для проекта <b>{project}</b>" + (f"\nКлиент: {client}" if client else ""),
-        reply_markup=kb
-    )
-    await state.update_data(last_menu_msg_id=m.message_id)
-
-# ============ КОМАНДЫ ПОЛЬЗОВАТЕЛЕЙ ============
-@dp.message(Command("start"))
-async def start_cmd(message: Message, state: FSMContext):
-    await state.clear()
-    text = (
-        "Привет! 👋\n\n"
-        "Команды:\n"
-        "• /otchet — отправить фотоотчёт\n"
-        "• /status — статус сдачи за неделю\n"
-        "\nАдмин-команды:\n"
-        "• /addstore — добавить магазин\n"
-        "• /delstore — удалить магазин\n"
-        "• /delproject — удалить проект целиком\n"
-    )
-    await message.answer(text)
-
-@dp.message(Command("otchet"))
-async def cmd_report(message: Message, state: FSMContext):
-    await state.clear()
-    kb = kb_projects(for_admin=False)
-    m = await message.answer("Выберите проект:", reply_markup=kb)
-    await state.update_data(flow="report", last_menu_msg_id=m.message_id)
-    await state.set_state(Report.waiting_project)
-
-@dp.message(Command("status"))
-async def cmd_status(message: Message, state: FSMContext):
-    await state.clear()
-    kb = kb_projects(for_admin=True)
-    m = await message.answer("Статус: выберите проект:", reply_markup=kb)
-    await state.update_data(flow="status", last_menu_msg_id=m.message_id)
-    await state.set_state(StatusFlow.waiting_project)
-
-# ============ АДМИН КОМАНДЫ ============
-def ensure_admin(user_id: int) -> bool:
-    return user_id in ADMINS
-
-@dp.message(Command("addstore"))
-async def addstore_start(message: Message, state: FSMContext):
-    if not ensure_admin(message.from_user.id):
-        await message.answer("⛔️ Недостаточно прав.")
-        return
-    await state.clear()
-    kb = kb_projects(for_admin=True)
-    m = await message.answer("Добавить магазин: выберите проект:", reply_markup=kb)
-    await state.update_data(flow="add", last_menu_msg_id=m.message_id)
-    await state.set_state(AdminAdd.waiting_project)
-
-@dp.message(Command("delstore"))
-async def delstore_start(message: Message, state: FSMContext):
-    if not ensure_admin(message.from_user.id):
-        await message.answer("⛔️ Недостаточно прав.")
-        return
-    await state.clear()
-    kb = kb_projects(for_admin=True)
-    m = await message.answer("Удалить магазин: выберите проект:", reply_markup=kb)
-    await state.update_data(flow="delstore", last_menu_msg_id=m.message_id)
-    await state.set_state(AdminDelStore.waiting_project)
-
-@dp.message(Command("delproject"))
-async def delproject_start(message: Message, state: FSMContext):
-    if not ensure_admin(message.from_user.id):
-        await message.answer("⛔️ Недостаточно прав.")
-        return
-    await state.clear()
-    names = list_projects()
-    if not names:
-        await message.answer("Нет проектов для удаления.")
-        return
-    builder = InlineKeyboardBuilder()
-    for p in names:
-        builder.button(text=f"Удалить {p}", callback_data=f"adm:delproject:{p}")
-    builder.button(text="❌ Отмена", callback_data="adm:cancel")
-    builder.adjust(1)
-    m = await message.answer("Выберите проект для удаления (безвозвратно):", reply_markup=builder.as_markup())
-    await state.update_data(flow="delproject", last_menu_msg_id=m.message_id)
-    await state.set_state(AdminDelProject.confirm)
-
-# ============ КОЛБЭКИ ОБЩИЕ ============
-@dp.callback_query(F.data == "cancel")
-async def cb_cancel(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await c.answer("Отменено", show_alert=False)
-    try:
-        await c.message.edit_text("Операция отменена.")
-    except Exception:
-        pass
-
-@dp.callback_query(F.data == "adm:cancel")
-async def cb_adm_cancel(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await c.answer("Отменено", show_alert=False)
-    try:
-        await c.message.edit_text("Админ-операция отменена.")
-    except Exception:
-        pass
-
-# ============ КОЛБЭКИ ДЛЯ /otchet ============
-@dp.callback_query(Report.waiting_project, F.data.startswith("proj:"))
-async def cb_report_pick_project(c: CallbackQuery, state: FSMContext):
-    project = c.data.split(":", 1)[1]
-    await c.answer()
-
-    # Сносим предыдущее меню-сообщение (если было)
-    data = await state.get_data()
-    last_menu_id = data.get("last_menu_msg_id")
-    if last_menu_id:
-        await safe_delete_message(c.message.chat.id, last_menu_id)
-
-    if is_multi(project):
-        kb = kb_clients(project, include_all_for_status=False, admin_flow=False)
-        m = await c.message.answer(f"Проект: <b>{project}</b>\nВыберите клиента:", reply_markup=kb)
-        await state.update_data(project=project, last_menu_msg_id=m.message_id)
-        await state.set_state(Report.waiting_client)
-    else:
-        # Идем сразу к списку магазинов
-        await state.update_data(project=project, client=None)
-        kb = kb_stores(project, client=None, admin_flow=False, vertical_greenworks=True)
-        m = await c.message.answer(f"Проект: <b>{project}</b>\nВыберите магазин:", reply_markup=kb)
-        await state.update_data(last_menu_msg_id=m.message_id)
-        await state.set_state(Report.waiting_store)
-
-@dp.callback_query(Report.waiting_client, F.data.startswith("proj:client:"))
-async def cb_report_pick_client(c: CallbackQuery, state: FSMContext):
-    _, _, project, client = c.data.split(":", 3)
-    await c.answer()
-    await state.update_data(project=project, client=client)
-    await prompt_clean_and_ask_store(c.message, project, client, state)
-    await state.set_state(Report.waiting_store)
-
-@dp.callback_query(Report.waiting_store, F.data.startswith("proj:store:"))
-async def cb_report_pick_store(c: CallbackQuery, state: FSMContext):
-    # proj:store:PROJECT:CLIENT_OR_*:STORE
-    _, _, project, client, store = c.data.split(":", 4)
-    if client == "*":
-        client = None
-    await c.answer()
-
-    # Сносим меню при выборе
-    data = await state.get_data()
-    last_menu_id = data.get("last_menu_msg_id")
-    if last_menu_id:
-        await safe_delete_message(c.message.chat.id, last_menu_id)
-
-    # Сообщение «отправляй фото»
-    title_lines = [f"📸 Отправляй фото для:\n<b>{store}</b>"]
-    if client:
-        title_lines.append(f"Клиент: {client}")
-    text = "\n".join(title_lines)
-
-    m = await c.message.answer(text)
-    # Сохраняем контекст
-    await state.update_data(project=project, client=client, store=store, anchor_msg_id=m.message_id)
-    await state.set_state(Report.waiting_photos)
-
-# Приём фото
-@dp.message(Report.waiting_photos, F.content_type == ContentType.PHOTO)
-async def handle_photo(message: Message, state: FSMContext):
-    data = await state.get_data()
-    project = data.get("project")
-    client  = data.get("client")
-    store   = data.get("store")
-
-    # Здесь у тебя может быть логика сохранения файла в Я.Диск через API.
-    # Сейчас ограничимся отметкой «сдал отчёт».
-    mark_submitted(project, store, client)
-
-    await message.answer("✅ Принял фото. Спасибо!")
-    # останемся в этом же состоянии — можно кидать ещё фото
-    # (или /start чтобы выйти)
-
-@dp.callback_query(F.data.startswith("back:"))
-async def cb_back(c: CallbackQuery, state: FSMContext):
-    """
-    Единая обработка «Назад»:
-    back:projects
-    back:clients:<PROJECT>
-    """
-    await c.answer()
-    parts = c.data.split(":")
-    where = parts[1]
-
-    data = await state.get_data()
-    last_menu_id = data.get("last_menu_msg_id")
-    if last_menu_id:
-        await safe_delete_message(c.message.chat.id, last_menu_id)
-
-    if where == "projects":
-        flow = data.get("flow", "report")
-        for_admin = (flow in ("add", "delstore", "status"))
-        kb = kb_projects(for_admin=for_admin)
-        m = await c.message.answer("Выберите проект:", reply_markup=kb)
-        await state.update_data(last_menu_msg_id=m.message_id)
-        if flow == "report":
-            await state.set_state(Report.waiting_project)
-        elif flow == "add":
-            await state.set_state(AdminAdd.waiting_project)
-        elif flow == "delstore":
-            await state.set_state(AdminDelStore.waiting_project)
-        elif flow == "status":
-            await state.set_state(StatusFlow.waiting_project)
-        else:
-            await state.clear()
-        return
-
-    if where == "clients":
-        project = parts[2] if len(parts) > 2 else data.get("project")
-        kb = kb_clients(project, include_all_for_status=False, admin_flow=False)
-        m = await c.message.answer(f"Проект: <b>{project}</b>\nВыберите клиента:", reply_markup=kb)
-        await state.update_data(last_menu_msg_id=m.message_id)
-        await state.set_state(Report.waiting_client)
-        return
-
-# ============ КОЛБЭКИ ДЛЯ /status ============
-@dp.callback_query(StatusFlow.waiting_project, F.data.startswith("proj:"))
-async def cb_status_pick_project(c: CallbackQuery, state: FSMContext):
-    project = c.data.split(":", 1)[1]
-    await c.answer()
-    await state.update_data(project=project)
-
-    # Сносим
-    data = await state.get_data()
-    last_menu_id = data.get("last_menu_msg_id")
-    if last_menu_id:
-        await safe_delete_message(c.message.chat.id, last_menu_id)
-
-    if is_multi(project):
-        kb = kb_clients(project, include_all_for_status=True, admin_flow=False)
-        m = await c.message.answer("Статус: выберите клиента или «Все клиенты»:", reply_markup=kb)
-        await state.update_data(last_menu_msg_id=m.message_id)
-        await state.set_state(StatusFlow.waiting_client)
-    else:
-        done, not_done = get_week_status(project, None)
-        text = [
-            f"📊 Статус за неделю {current_week_label()}",
-            f"Проект: <b>{project}</b>",
-            "",
-            f"✅ Сдали ({len(done)}):",
-        ]
-        text += [f"• {x}" for x in done] if done else ["—"]
-        text += ["", f"❌ Не сдали ({len(not_done)}):"]
-        text += [f"• {x}" for x in not_done] if not_done else ["—"]
+    # отменяем предыдущий таймер
+    task: Optional[asyncio.Task] = session.get("summary_task")
+    if task and not task.done():
+        task.cancel()
         try:
-            await c.message.edit_text("\n".join(text))
+            await task
         except Exception:
-            await c.message.answer("\n".join(text))
+            pass
 
-@dp.callback_query(StatusFlow.waiting_client, F.data.startswith("status:client:"))
-async def cb_status_pick_client(c: CallbackQuery, state: FSMContext):
-    # status:client:PROJECT:* or :CLIENT
-    _, _, project, client = c.data.split(":", 3)
-    await c.answer()
-    if client == "*":
-        client_opt = None
-    else:
-        client_opt = client
+    async def delayed():
+        try:
+            await asyncio.sleep(SUMMARY_DELAY_SEC)
+            sess = user_sessions.get(user_id)
+            if not sess:
+                return
+            total = len(sess.get("files", []))
+            text = (
+                f"Фото принято ✅  Всего: {total} шт.\n\n"
+                f"Когда закончите — нажмите кнопку ниже, чтобы отправить отчёт."
+            )
+            kb = build_send_keyboard()
+            if sess.get("status_msg"):
+                chat_id, msg_id = sess["status_msg"]
+                try:
+                    await bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+                except Exception:
+                    sent = await message.answer(text, reply_markup=kb)
+                    sess["status_msg"] = (sent.chat.id, sent.message_id)
+            else:
+                sent = await message.answer(text, reply_markup=kb)
+                sess["status_msg"] = (sent.chat.id, sent.message_id)
+        except asyncio.CancelledError:
+            return
 
-    done, not_done = get_week_status(project, client_opt)
-    header = f"📊 Статус за неделю {current_week_label()}\nПроект: <b>{project}</b>"
-    if client_opt:
-        header += f"\nКлиент: {client_opt}"
+    session["summary_task"] = asyncio.create_task(delayed())
 
-    text = [header, "", f"✅ Сдали ({len(done)}):"]
-    text += [f"• {x}" for x in done] if done else ["—"]
-    text += ["", f"❌ Не сдали ({len(not_done)}):"]
-    text += [f"• {x}" for x in not_done] if not_done else ["—"]
+def clear_summary_task(session: Dict[str, Any]):
+    task: Optional[asyncio.Task] = session.get("summary_task")
+    if task and not task.done():
+        task.cancel()
+
+# ====== ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ ======
+@dp.message(Command("otchet"))
+async def cmd_report(message: Message):
+    # если админ находился в режимах добавления/удаления — сбросить
+    set_mode(message.from_user.id, None)
+    # новая чистая сессия для отчёта
+    user_sessions[message.from_user.id] = {
+        "files": [],
+        "tmp_dir": os.path.join("tmp_reports", str(message.from_user.id)),
+        "status_msg": None,
+        "summary_task": None,
+    }
+    os.makedirs(user_sessions[message.from_user.id]["tmp_dir"], exist_ok=True)
+    await message.answer("Выберите магазин (нажми кнопку):", reply_markup=build_stores_keyboard())
+
+# ====== ВЫБОР МАГАЗИНА ======
+@dp.callback_query(lambda c: c.data and c.data.startswith("store:"))
+async def process_store_choice(cq: CallbackQuery):
+    await cq.answer()
+    user_id = cq.from_user.id
+    stores = load_stores()
+
+    # в callback хранится индекс в отсортированном списке, поэтому пересоберём тот же порядок
+    def store_key(s: str) -> int:
+        nums = re.findall(r"\d+", s)
+        return int(nums[-1]) if nums else 0
+    sorted_stores = sorted(stores, key=store_key)
+
+    idx = int(cq.data.split(":", 1)[1])
+    if idx < 0 or idx >= len(sorted_stores):
+        await cq.message.answer("Не удалось определить магазин, попробуйте ещё раз: /otchet")
+        return
+
+    store = sorted_stores[idx]
+
+    user_sessions.setdefault(user_id, {})
+    user_sessions[user_id]["store"] = store
+    await cq.message.answer("Теперь отправьте фото.\nПосле всех фото нажмите кнопку «📤 Отправить отчёт».")
+
+@dp.callback_query(lambda c: c.data == "cancel")
+async def on_cancel(cq: CallbackQuery):
+    await cq.answer()
+    sess = user_sessions.pop(cq.from_user.id, None)
+    if sess:
+        clear_summary_task(sess)
+    set_mode(cq.from_user.id, None)
+    await cq.message.answer("Отменено. Начни заново: /otchet")
+
+# ====== ФОТО: без спама, статус по таймеру тишины ======
+@dp.message(F.photo)
+async def handle_photo(message: Message):
+    user_id = message.from_user.id
+    # фото принимаем вне зависимостей от админ-режимов
+    session = user_sessions.get(user_id)
+    if not session or "store" not in session:
+        await message.answer("Пожалуйста, сначала вызови /otchet и выбери магазин.")
+        return
+
+    photo = message.photo[-1]
+    file_info = await bot.get_file(photo.file_id)
+    ts = datetime.now(MSK).strftime("%Y-%m-%d_%H-%M-%S")
+    local_filename = os.path.join(session["tmp_dir"], f"{ts}_{photo.file_id}.jpg")
+    await bot.download_file(file_info.file_path, destination=local_filename)
+    session.setdefault("files", []).append(local_filename)
+
+    await schedule_summary_message(message, user_id)
+
+# ====== ОТПРАВИТЬ ОТЧЁТ ======
+@dp.callback_query(lambda c: c.data == "confirm_upload")
+async def on_confirm_upload(cq: CallbackQuery):
+    await cq.answer()
+    user_id = cq.from_user.id
+    session = user_sessions.get(user_id)
+    if not session or not session.get("files") or "store" not in session:
+        await cq.message.answer("Нет фото для загрузки. Отправьте фото или вызовите /otchet.")
+        return
+
+    clear_summary_task(session)
+    if session.get("status_msg"):
+        chat_id, msg_id = session["status_msg"]
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
+        session["status_msg"] = None
+
+    loading = await cq.message.answer("Идёт загрузка отчёта на Яндекс.Диск... Пожалуйста, подождите.")
+
+    store = session["store"]
+    files = list(session["files"])
+    week_folder = get_week_folder()
+    base = YANDEX_BASE
+    week_path = f"{base}/{week_folder}"
+    store_path = f"{week_path}/{store}"
+
+    def do_upload():
+        ensure_folder_exists(base)
+        ensure_folder_exists(week_path)
+        ensure_folder_exists(store_path)
+        uploaded = 0
+        for local_file in files:
+            remote_path = f"{store_path}/{os.path.basename(local_file)}"
+            if upload_to_yandex(local_file, remote_path):
+                uploaded += 1
+                try:
+                    os.remove(local_file)
+                except Exception:
+                    pass
+        # удалить пустую временную папку
+        try:
+            tmpdir = session.get("tmp_dir")
+            if tmpdir and os.path.isdir(tmpdir) and not os.listdir(tmpdir):
+                os.rmdir(tmpdir)
+        except Exception:
+            pass
+        return uploaded, len(files)
+
+    loop = asyncio.get_event_loop()
+    uploaded, total = await loop.run_in_executor(None, do_upload)
+
+    if uploaded > 0:
+        submitted_by_week.setdefault(week_folder, set()).add(store)
 
     try:
-        await c.message.edit_text("\n".join(text))
+        await bot.delete_message(loading.chat.id, loading.message_id)
     except Exception:
-        await c.message.answer("\n".join(text))
+        pass
 
-# ============ КОЛБЭКИ ДЛЯ /addstore ============
-@dp.callback_query(AdminAdd.waiting_project, F.data.startswith("proj:"))
-async def cb_add_pick_project(c: CallbackQuery, state: FSMContext):
-    project = c.data.split(":", 1)[1]
-    await c.answer()
-    await state.update_data(project=project)
+    final_text = (
+        f"Загрузка завершена.\n"
+        f"✅ Успешно загружено: {uploaded} из {total}.\n"
+        f"Папка: {store_path}"
+    )
+    await cq.message.answer(final_text)
 
-    # снести пред. меню
-    data = await state.get_data()
-    last_menu_id = data.get("last_menu_msg_id")
-    if last_menu_id:
-        await safe_delete_message(c.message.chat.id, last_menu_id)
+    user_sessions.pop(user_id, None)
 
-    if is_multi(project):
-        kb = kb_clients(project, include_all_for_status=False, admin_flow=True)
-        m = await c.message.answer(f"Проект: <b>{project}</b>\nВыберите клиента:", reply_markup=kb)
-        await state.update_data(last_menu_msg_id=m.message_id)
-        await state.set_state(AdminAdd.waiting_client)
-    else:
-        await state.update_data(client=None)
-        m = await c.message.answer("Введите название магазина (текстом). Для отмены — /start")
-        await state.update_data(last_menu_msg_id=m.message_id)
-        await state.set_state(AdminAdd.waiting_name)
-
-@dp.callback_query(AdminAdd.waiting_client, F.data.startswith("adm:client:"))
-async def cb_add_pick_client(c: CallbackQuery, state: FSMContext):
-    _, _, project, client = c.data.split(":", 3)
-    await c.answer()
-    await state.update_data(project=project, client=client)
-
-    # снести пред. меню
-    data = await state.get_data()
-    last_menu_id = data.get("last_menu_msg_id")
-    if last_menu_id:
-        await safe_delete_message(c.message.chat.id, last_menu_id)
-
-    m = await c.message.answer("Введите название магазина (текстом). Для отмены — /start")
-    await state.update_data(last_menu_msg_id=m.message_id)
-    await state.set_state(AdminAdd.waiting_name)
-
-@dp.message(AdminAdd.waiting_name, F.text)
-async def cb_add_name(message: Message, state: FSMContext):
-    name = message.text.strip()
-    data = await state.get_data()
-    project = data.get("project")
-    client  = data.get("client")
-    if not name:
-        await message.answer("Пустое имя, введите ещё раз.")
-        return
-    if name.upper() in ("DELETE", "/DELETE", "DEL", "/DEL"):
-        await message.answer("❗️ Нельзя называть магазин «DELETE». Введите другое имя.")
+# ===================== АДМИН: /status =====================
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Эта команда недоступна.")
         return
 
-    ok = add_store(project, name, client)
-    if ok:
-        info = f"Добавлен магазин «{name}» в проект «{project}»"
-        if client:
-            info += f" (клиент: {client})"
-        await message.answer(f"✅ {info}")
+    week = get_week_folder()
+    week_path = f"{YANDEX_BASE}/{week}"
+
+    existing_dirs = set(list_folder_children(week_path))
+    if not existing_dirs:
+        existing_dirs = submitted_by_week.get(week, set())
+
+    all_stores = load_stores()
+    total = len(all_stores)
+    done = sorted([s for s in all_stores if s in existing_dirs])
+    missing = sorted([s for s in all_stores if s not in existing_dirs])
+
+    lines = [f"📆 Неделя: {week}", f"✅ Отчёты получены: {len(done)} / {total}"]
+    if missing:
+        lines.append("\n❌ Не прислали:")
+        lines += [f"• {s}" for s in missing]
     else:
-        await message.answer("❌ Не удалось добавить магазин. Проверь проект/клиента.")
+        lines.append("\n🎉 Все магазины прислали отчёт!")
 
-    await state.clear()
+    await message.answer("\n".join(lines))
 
-# ============ КОЛБЭКИ ДЛЯ /delstore ============
-@dp.callback_query(AdminDelStore.waiting_project, F.data.startswith("proj:"))
-async def cb_delstore_project(c: CallbackQuery, state: FSMContext):
-    project = c.data.split(":", 1)[1]
-    await c.answer()
-    await state.update_data(project=project)
+# ===================== АДМИН: /addstore =====================
+@dp.message(Command("addstore"))
+async def cmd_addstore(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Эта команда недоступна.")
+        return
 
-    # снести пред. меню
-    data = await state.get_data()
-    last_menu_id = data.get("last_menu_msg_id")
-    if last_menu_id:
-        await safe_delete_message(c.message.chat.id, last_menu_id)
+    set_mode(ADMIN_ID, "adding")
+    await message.answer(
+        "Пришлите **название магазина одной строкой**.\n"
+        "Формат: `ОБИ 034 Саратов` (строго с номером магазина).",
+        reply_markup=build_cancel_kb("add"),
+    )
 
-    kb = kb_delstore_chooser(project)
-    m = await c.message.answer(f"Удаление магазина.\nПроект: <b>{project}</b>\nВыберите магазин:", reply_markup=kb)
-    await state.update_data(last_menu_msg_id=m.message_id)
-    await state.set_state(AdminDelStore.waiting_store)
+@dp.callback_query(lambda c: c.data == "admin_cancel:add")
+async def cancel_add(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID:
+        await cq.answer()
+        return
+    set_mode(ADMIN_ID, None)
+    await cq.message.edit_text("Добавление магазина отменено.")
 
-@dp.callback_query(AdminDelStore.waiting_store, F.data.startswith("adm:delstore:"))
-async def cb_delstore_confirm(c: CallbackQuery, state: FSMContext):
-    # adm:delstore:PROJECT:CLIENTOR* : STORE
-    _, _, project, client, store = c.data.split(":", 4)
-    await c.answer()
-    ok = del_store(project, store)
-    if ok:
-        await c.message.edit_text(f"🗑 Удалён магазин <b>{store}</b> из проекта <b>{project}</b>.")
+@dp.message(lambda m: get_mode(m.from_user.id) == "adding")
+async def addstore_text(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = normalize_name(message.text or "")
+    # запрет на команды, чтобы случайно не записать /delstore как магазин
+    if text.startswith("/"):
+        await message.answer("Это похоже на команду. Пришлите именно **название магазина**.\nНапример: `ОБИ 034 Саратов`")
+        return
+    if not is_store_name_valid(text):
+        await message.answer("Неверный формат. Пример: `ОБИ 034 Саратов`")
+        return
+
+    stores = load_stores()
+    lower_set = {s.lower() for s in stores}
+    if text.lower() in lower_set:
+        await message.answer("Такой магазин уже есть в списке.")
+        set_mode(ADMIN_ID, None)
+        return
+
+    stores.append(text)
+    save_stores(stores)
+    set_mode(ADMIN_ID, None)
+    await message.answer(f"✅ Магазин добавлен: {text}")
+
+# ===================== АДМИН: /delstore =====================
+@dp.message(Command("delstore"))
+async def cmd_delstore(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Эта команда недоступна.")
+        return
+
+    set_mode(ADMIN_ID, "deleting")
+    stores = load_stores()
+    if not stores:
+        await message.answer("Список магазинов пуст.")
+        set_mode(ADMIN_ID, None)
+        return
+
+    await message.answer(
+        "Выберите магазин для удаления:",
+        reply_markup=build_del_list_kb(stores)
+    )
+
+@dp.callback_query(lambda c: c.data.startswith("delpick:"))
+async def on_del_pick(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID:
+        await cq.answer()
+        return
+    if get_mode(ADMIN_ID) != "deleting":
+        await cq.answer("Режим удаления не активен.")
+        return
+
+    stores = load_stores()
+    idx = int(cq.data.split(":")[1])
+    if idx < 0 or idx >= len(stores):
+        await cq.answer("Магазин не найден.")
+        return
+
+    await cq.message.edit_text(
+        f"Удалить магазин?\n\n• {stores[idx]}",
+        reply_markup=build_del_confirm_kb(idx)
+    )
+
+@dp.callback_query(lambda c: c.data == "delback")
+async def on_del_back(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID:
+        await cq.answer()
+        return
+    if get_mode(ADMIN_ID) != "deleting":
+        await cq.answer()
+        return
+    await cq.message.edit_text("Выберите магазин для удаления:", reply_markup=build_del_list_kb(load_stores()))
+
+@dp.callback_query(lambda c: c.data.startswith("delyes:"))
+async def on_del_yes(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID:
+        await cq.answer()
+        return
+    if get_mode(ADMIN_ID) != "deleting":
+        await cq.answer()
+        return
+
+    stores = load_stores()
+    idx = int(cq.data.split(":")[1])
+    if idx < 0 or idx >= len(stores):
+        await cq.answer("Магазин не найден.")
+        return
+
+    removed = stores.pop(idx)
+    save_stores(stores)
+    # после удаления остаёмся в режиме удаления (можно удалить ещё), либо выйти — на ваш вкус
+    if stores:
+        await cq.message.edit_text(
+            f"🗑 Удалено: {removed}\n\nВыберите следующий магазин для удаления:",
+            reply_markup=build_del_list_kb(stores)
+        )
     else:
-        await c.message.edit_text("❌ Не удалось удалить магазин.")
-    await state.clear()
+        set_mode(ADMIN_ID, None)
+        await cq.message.edit_text(f"🗑 Удалено: {removed}\n\nСписок магазинов пуст.")
 
-# ============ КОЛБЭКИ ДЛЯ /delproject ============
-@dp.callback_query(AdminDelProject.confirm, F.data.startswith("adm:delproject:"))
-async def cb_delproject(c: CallbackQuery, state: FSMContext):
-    project = c.data.split(":", 2)[2]
-    await c.answer()
-    ok = del_project(project)
-    if ok:
-        await c.message.edit_text(f"🧨 Проект <b>{project}</b> удалён вместе со списком магазинов.")
-    else:
-        await c.message.edit_text("❌ Не удалось удалить проект.")
-    await state.clear()
+@dp.callback_query(lambda c: c.data == "admin_cancel:del")
+async def cancel_del(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID:
+        await cq.answer()
+        return
+    set_mode(ADMIN_ID, None)
+    await cq.message.edit_text("Удаление магазинов отменено.")
 
-# ============ СИСТЕМНОЕ ============
-async def on_startup():
-    ensure_seed()
-    log.info("✅ Бот запущен и слушает Telegram...")
-
-# aiogram v3: стартуем поллинг
-if __name__ == "__main__":
-    import asyncio
-    async def main():
-        ensure_seed()
-        await on_startup()
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+# ====== on_startup: меню для админа (не трогаем меню для сотрудников) ======
+async def on_startup(bot: Bot):
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        log.warning("Bot stopped")
+        await bot.set_my_commands(
+            commands=[
+                BotCommand(command="otchet", description="Начать отчёт"),
+                BotCommand(command="status", description="Статус отчётов"),
+                BotCommand(command="addstore", description="Добавить магазин"),
+                BotCommand(command="delstore", description="Удалить магазин"),
+            ],
+            scope=BotCommandScopeChat(chat_id=ADMIN_ID),
+        )
+    except Exception as e:
+        logging.warning("Can't set admin-only menu: %s", e)
+
+dp.startup.register(on_startup)
+
+# ====== ЗАПУСК ======
+if __name__ == "__main__":
+    print("✅ Бот запущен и слушает Telegram...")
+    dp.run_polling(bot)
